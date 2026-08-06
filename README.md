@@ -6,20 +6,50 @@ A `TransformStream<Uint8Array, Uint8Array>` that scans bytes. It never decodes t
 spans between tokens through without copying, and gets chunk boundaries right. Zero dependencies,
 ESM only, ~6x faster to first byte than buffer-and-replace.
 
+```sh
+npm install stream-token-substitute
+```
+
+A whole edge handler: a cached shell from the origin, a per-request nonce in it, first byte out
+before the last byte is in.
+
 ```ts
 import { resolveFrom, substituteResponse } from "stream-token-substitute/helpers";
 
-const origin = await fetch("https://origin.example/shell.html");
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const nonce = crypto.randomUUID();
+    const shell = await fetch("https://origin.example/shell.html"); // {{title}}, {{nonce}}
 
-return substituteResponse(origin, {
-  open: "{{",
-  close: "}}",
-  resolve: resolveFrom({ title: "Hello", nonce }),
-});
+    const response = substituteResponse(shell, {
+      open: "{{",
+      close: "}}",
+      resolve: resolveFrom({ title: "Hello", nonce }),
+    });
+
+    response.headers.set("content-security-policy", `script-src 'nonce-${nonce}'`);
+    return response;
+  },
+};
 ```
 
-```sh
-npm install stream-token-substitute
+`substituteResponse` pipes the body through a transformer and drops the headers that no longer
+describe it. Without it, the same thing by hand:
+
+```ts
+import { createTokenTransformStream } from "stream-token-substitute";
+
+const decoder = new TextDecoder();
+
+const transformer = createTokenTransformStream({
+  open: "{{",
+  close: "}}",
+  resolve: (payload) => values.get(decoder.decode(payload)) ?? null, // null leaves it verbatim
+});
+
+return new Response(shell.body.pipeThrough(transformer), {
+  headers: { "content-type": "text/html; charset=utf-8" },
+});
 ```
 
 Node 18+ and Cloudflare Workers, both tested in CI.
@@ -75,7 +105,9 @@ Six entrypoints. The core carries nothing the others add.
 | `stream-token-substitute/node` | `createTokenTransform`, `createAsyncTokenTransform`, `createNeedleTransform` |
 
 Transformers are single-use: construct one per stream. `create*Transformer` returns the bare
-`{ transform, flush }` for runtimes where `TransformStream` is not a global.
+`{ transform, flush }` for runtimes where `TransformStream` is not a global. `resolveFrom` builds
+a resolver over a record or `Map`, matching names as bytes bucketed by length so a lookup never
+decodes the payload; unknown names resolve to `null` and pass through verbatim.
 
 ### `TokenTransformOptions`
 
