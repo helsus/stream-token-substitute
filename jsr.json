@@ -1,0 +1,16 @@
+{
+  "name": "@helsus/stream-token-substitute",
+  "version": "1.0.0",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./needles": "./src/needles.ts",
+    "./async": "./src/async-transformer.ts",
+    "./html": "./src/html-escape.ts",
+    "./helpers": "./src/helpers.ts",
+    "./node": "./src/node.ts"
+  },
+  "publish": {
+    "include": ["src", "README.md", "LICENSE", "jsr.json"]
+  }
+}

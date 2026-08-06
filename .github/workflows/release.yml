@@ -47,8 +47,13 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME#v}"
           pkg="$(node -p 'require("./package.json").version')"
+          jsr="$(node -p 'require("./jsr.json").version')"
           if [ "$tag" != "$pkg" ]; then
             echo "tag $tag does not match package.json $pkg" >&2
+            exit 1
+          fi
+          if [ "$tag" != "$jsr" ]; then
+            echo "tag $tag does not match jsr.json $jsr" >&2
             exit 1
           fi
 
@@ -64,6 +69,31 @@ jobs:
           else
             echo "Dry run: set the publish input, or push a v* tag, to ship."
             npm publish --access public --dry-run
+          fi
+        env:
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+
+  jsr:
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Publish
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            npx --yes jsr publish
+          else
+            echo "Dry run: set the publish input, or push a v* tag, to ship."
+            npx --yes jsr publish --dry-run
           fi
         env:
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
