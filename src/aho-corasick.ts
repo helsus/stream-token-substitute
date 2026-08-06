@@ -5,7 +5,7 @@
 export class AhoCorasick {
   /** byte -> DFA column. 0 for bytes no needle contains; that column is all
    *  zeros, so unknown bytes land on the root for free. */
-  readonly classOf = new Uint16Array(256);
+  readonly classOf: Uint16Array = new Uint16Array(256);
   /** Columns per state: distinct needle bytes + 1. */
   readonly width: number;
   /** delta[node * width + classOf[byte]] is the next node. */
