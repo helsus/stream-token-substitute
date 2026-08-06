@@ -1,0 +1,63 @@
+name: Release
+
+# Publishing is gated. `workflow_dispatch` defaults to a dry run, so the whole
+# pipeline can be exercised before anything reaches the registry. Flip the
+# `publish` input, or push a v* tag, to actually ship.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm (otherwise dry run)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The full matrix has to be green: a release must not be the first place a
+  # runtime regression shows up.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # provenance attestation
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run build
+
+      # A tag that disagrees with package.json ships the wrong version silently.
+      - if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p 'require("./package.json").version')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $tag does not match package.json $pkg" >&2
+            exit 1
+          fi
+
+      - run: npx --yes publint
+      - run: npx --yes @arethetypeswrong/cli --pack . --profile esm-only
+
+      - name: Publish
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            npm publish --provenance --access public
+          else
+            echo "Dry run: set the publish input, or push a v* tag, to ship."
+            npm publish --provenance --access public --dry-run
+          fi
+        env:
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,94 @@
+{
+  "name": "stream-token-substitute",
+  "version": "0.1.0",
+  "description": "Streaming, chunk-boundary-safe, zero-copy byte-level token substitution for Web Streams runtimes",
+  "type": "module",
+  "sideEffects": false,
+  "license": "MIT",
+  "author": "Ivan Buiko <ivan@buiko.com>",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./needles": {
+      "types": "./dist/needles.d.ts",
+      "default": "./dist/needles.js"
+    },
+    "./async": {
+      "types": "./dist/async-transformer.d.ts",
+      "default": "./dist/async-transformer.js"
+    },
+    "./html": {
+      "types": "./dist/html-escape.d.ts",
+      "default": "./dist/html-escape.js"
+    },
+    "./helpers": {
+      "types": "./dist/helpers.d.ts",
+      "default": "./dist/helpers.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "aho-corasick",
+    "akamai",
+    "bun",
+    "cloudflare-workers",
+    "deno",
+    "edge",
+    "edgeworkers",
+    "fastly",
+    "replace",
+    "search-replace",
+    "stream",
+    "streaming-replace",
+    "substitution",
+    "template",
+    "transformstream",
+    "web-streams",
+    "zero-copy"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:gc": "NODE_OPTIONS=--expose-gc vitest run test/streaming.test.ts",
+    "bench": "node bench/bench.ts",
+    "typecheck": "tsc --noEmit && tsc -p runtime --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test:workers": "vitest run -c vitest.workers.config.ts",
+    "test:fuzz": "vitest run test/differential.test.ts test/needles.test.ts",
+    "bench:workers": "vitest run -c vitest.workers-bench.config.ts --disableConsoleIntercept"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.14",
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "@types/node": "^24.13.3",
+    "mitata": "^1.0.34",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.119.0"
+  },
+  "overrides": {
+    "undici": "^7.29.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/helsus/stream-token-substitute.git"
+  },
+  "homepage": "https://github.com/helsus/stream-token-substitute#readme",
+  "bugs": {
+    "url": "https://github.com/helsus/stream-token-substitute/issues"
+  }
+}
