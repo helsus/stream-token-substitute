@@ -32,8 +32,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1; do not rely on what Node ships.
+      - run: npm install -g npm@^11.5.1
       - run: npm ci
       - run: npm run build
 
@@ -50,14 +52,15 @@ jobs:
       - run: npx --yes publint
       - run: npx --yes @arethetypeswrong/cli --pack . --profile esm-only
 
+      # Trusted publishing: npm mints a short-lived token from the OIDC claim,
+      # so there is no NPM_TOKEN, and provenance is attached automatically.
       - name: Publish
         run: |
           if [ "$PUBLISH" = "true" ]; then
-            npm publish --provenance --access public
+            npm publish --access public
           else
             echo "Dry run: set the publish input, or push a v* tag, to ship."
-            npm publish --provenance --access public --dry-run
+            npm publish --access public --dry-run
           fi
         env:
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

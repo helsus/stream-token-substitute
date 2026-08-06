@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Dev dependencies only: the package itself ships zero runtime deps.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      dev-minor:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  # Keeps the SHA pins in the workflows current, comment and all.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
