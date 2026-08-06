@@ -68,6 +68,8 @@
     "lint": "biome check .",
     "format": "biome check --write .",
     "test:workers": "vitest run -c vitest.workers.config.ts",
+    "test:bun": "bun test runtime/bun.test.ts",
+    "test:deno": "deno test runtime/deno.test.ts",
     "test:fuzz": "vitest run test/differential.test.ts test/needles.test.ts",
     "bench:workers": "vitest run -c vitest.workers-bench.config.ts --disableConsoleIntercept"
   },
