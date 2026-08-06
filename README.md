@@ -40,6 +40,8 @@ describe it. Without it, the same thing by hand:
 import { createTokenTransformStream } from "stream-token-substitute";
 
 const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+const values = new Map([["title", encoder.encode("Hello")]]);
 
 const transformer = createTokenTransformStream({
   open: "{{",
@@ -210,9 +212,11 @@ Substitution changes the body length, so do not forward the upstream `Content-Le
 > same substitution run over the whole input at once.
 
 A differential fuzzer runs the streaming implementations against naive references over a
-delimiter matrix, random and exhaustive chunkings, and a matrix of validators and resolvers, in
-Node and again under workerd. The seed is fixed so a failure reproduces exactly; override it with
-`FUZZ_SEED` and `FUZZ_ROUNDS` to search harder.
+delimiter matrix, random and exhaustive chunkings, and a matrix of validators and resolvers. The
+seed is fixed so a failure reproduces exactly; override it with `FUZZ_SEED` and `FUZZ_ROUNDS` to
+search harder. It runs on Node and again under workerd, where chunking and backpressure differ,
+though only the Node run takes those two variables. Bun and Deno re-run the smaller contract
+checks.
 
 ## Performance
 
@@ -237,7 +241,9 @@ never O(body).
 
 ## Runtimes
 
-Node 18, 20, 22 and 24, and Cloudflare Workers (workerd), are tested in CI.
+The full suite runs on Node 18, 20, 22 and 24 in CI. Cloudflare Workers (workerd), Bun and Deno
+run the five cross-runtime contract checks in `test/cross-runtime.ts`, each under that runtime's
+own test runner.
 
 The core touches two globals, `TransformStream` and (for string delimiters only) `TextEncoder`,
 both avoidable via `createTokenTransformer` and byte delimiters, and constructs nothing at import
@@ -251,6 +257,7 @@ time, so it runs where streams and encoding are modules rather than globals.
 npm test               # units, properties, differential fuzz, security, portability
 npm run test:fuzz      # FUZZ_SEED=12345 FUZZ_ROUNDS=2000 to override
 npm run test:workers   # the same contract checks under workerd
+npm run test:bun       # test:deno for the other runtimes
 npm run bench          # bench:workers for output shape and the memory ceiling
 ```
 

@@ -41,13 +41,10 @@
   },
   "keywords": [
     "aho-corasick",
-    "akamai",
     "bun",
     "cloudflare-workers",
     "deno",
     "edge",
-    "edgeworkers",
-    "fastly",
     "replace",
     "search-replace",
     "stream",
