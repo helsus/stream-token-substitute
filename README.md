@@ -54,7 +54,7 @@ return new Response(shell.body.pipeThrough(transformer), {
 });
 ```
 
-Node 18+ and Cloudflare Workers, both tested in CI.
+Node 18+ and Cloudflare Workers, tested in CI on Node 20, 22 and 24.
 
 ## Why
 
@@ -246,7 +246,8 @@ never O(body).
 
 ## Runtimes
 
-The full suite runs on Node 18, 20, 22 and 24 in CI. Cloudflare Workers (workerd), Bun and Deno
+The full suite runs on Node 20, 22 and 24 in CI. Node 18 is still supported but not exercised:
+the test runner does not start on it. Cloudflare Workers (workerd), Bun and Deno
 run the five cross-runtime contract checks in `test/cross-runtime.ts`, each under that runtime's
 own test runner.
 
