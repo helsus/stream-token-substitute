@@ -1,4 +1,4 @@
-import { copyBytes, EMPTY, grow, requeue } from "./bytes.ts";
+import { copyBytes, EMPTY, requeue } from "./bytes.ts";
 import { COMPLETE, DelimiterMatcher, REJECTED } from "./matcher.ts";
 import { Emitter } from "./output.ts";
 import {
@@ -61,6 +61,12 @@ export class Substituter {
 
   // Chunks may be backed by any ArrayBufferLike, including SharedArrayBuffer.
   private chunk: Uint8Array<ArrayBufferLike> = EMPTY;
+
+  // The buffer being scanned: the chunk, or the re-scan queue. `srcOwned` marks
+  // one the scanner reuses, whose spans must be copied to be emitted.
+  private src: Uint8Array<ArrayBufferLike> = EMPTY;
+  private srcEnd = 0;
+  private srcOwned = false;
   private i = 0;
   private flushStart = 0;
 
@@ -70,18 +76,17 @@ export class Substituter {
 
   private readonly out: Emitter;
 
-  // Re-scan queue. A reused scratch: live bytes are queue[0..queueLen).
-  // abortToken() rewrites it in place and bumps queueGen, which is how drain()
-  // tells a replaced queue from a consumed byte.
-  private draining = false;
+  // Re-scan queue. A reused scratch: live bytes are queue[0..queueLen). The
+  // payload it replays spans earlier chunks, so it cannot be re-read in place.
+  private inQueue = false;
   private queue = EMPTY;
   private queueLen = 0;
-  private qi = 0;
-  private queueGen = 0;
-
-  // Drained content bytes have no backing chunk, so they accumulate here.
-  private drainBuf = EMPTY;
-  private drainLen = 0;
+  // The chunk cursor, parked while the queue is scanned. Fields, not locals: an
+  // async resolver can suspend mid-queue and unwind the stack.
+  private chunkI = 0;
+  private chunkFlushStart = 0;
+  /** abortToken() re-entered the queue, so the cursor must not advance. */
+  private restarted = false;
 
   constructor(options: TokenTransformOptions) {
     const compiled = compileOptions(options);
@@ -116,96 +121,133 @@ export class Substituter {
 
     this.chunk = chunk;
     this.out.ctrl = ctrl;
-    this.i = 0;
-    this.flushStart = 0;
+    this.enter(chunk, chunk.length, false, 0, 0);
     if (this.stats !== undefined) this.stats.bytesIn += chunk.length;
   }
 
   /** Scan the current chunk to its end, or until an async resolver suspends.
    *  Re-entrant: every exit point leaves the fields ready for the next call. */
   protected pump(): void {
-    const chunk = this.chunk;
-    const count = chunk.length;
-
-    while (this.i < count) {
-      if (this.draining) {
-        // A drain interrupted by a suspended token: pick it back up.
-        this.drain();
-        if (this.suspended) return;
-        this.i++;
-        continue;
-      }
-
-      if (this.state === OUTSIDE) {
-        // k === 0 means no held state, so a delimiter contained in this chunk
-        // can be settled by indexOf (a SIMD memchr) plus a direct compare. Only
-        // one straddling the chunk end needs the matcher.
-        if (this.openM.k === 0) {
-          const open = this.openBytes;
-          const len = open.length;
-          let matched = false;
-          for (;;) {
-            const idx = chunk.indexOf(this.openFirst, this.i);
-            if (idx < 0) {
-              this.i = count;
-              break;
-            }
-            if (idx + len > count) {
-              this.i = idx;
-              break;
-            }
-            let m = 1;
-            while (m < len && chunk[idx + m] === open[m]) m++;
-            if (m === len) {
-              this.i = idx + len - 1;
-              this.startToken();
-              matched = true;
-              break;
-            }
-            this.i = idx + 1;
-          }
-          if (this.i >= count) break;
-          if (matched) {
-            this.i++;
-            continue;
-          }
-        }
-      } else if (this.closeM.k === 0 && this.validate === undefined) {
-        // No validator: bulk-copy up to the next possible closePat start.
-        const j = this.findClose(chunk, this.i, count);
-        if (j > this.i) {
-          this.ensureScratch(this.payloadLen + (j - this.i));
-          copyBytes(this.payload, this.payloadLen, chunk, this.i, j);
-          this.payloadLen += j - this.i;
-          this.i = j;
-          continue;
-        }
-      }
-
-      this.step(chunk[this.i]);
-      if (this.suspended) return;
-      if (this.queueLen > 0) {
-        this.drain();
-        if (this.suspended) return;
-      }
-      this.i++;
-    }
-
-    if (this.state === OUTSIDE) {
-      const k = this.openM.k;
-      if (k > 0) {
-        // Candidacy bytes still in this chunk become virtual.
-        this.flushSpan(count - (k - this.carry));
-        this.carry = k;
-      } else {
-        this.flushSpan(count);
-      }
-    }
-    // IN_TOKEN: in-token bytes are never part of a pending span.
-
+    this.scan();
+    if (this.suspended) return;
+    this.park();
     // Must precede dropping the chunk: buffered spans are views into it.
     this.out.flush();
     this.chunk = EMPTY;
+    this.src = EMPTY;
+  }
+
+  private enter(
+    src: Uint8Array<ArrayBufferLike>,
+    end: number,
+    owned: boolean,
+    i: number,
+    flushStart: number,
+  ): void {
+    this.src = src;
+    this.srcEnd = end;
+    this.srcOwned = owned;
+    this.i = i;
+    this.flushStart = flushStart;
+  }
+
+  /** Scan the current buffer, descending into the re-scan queue whenever an
+   *  abort fills it and coming back out where it left off. */
+  private scan(): void {
+    for (;;) {
+      // Re-read per iteration: an abort inside the queue replaces the buffer.
+      while (this.i < this.srcEnd) {
+        const src = this.src;
+        const end = this.srcEnd;
+
+        if (this.state === OUTSIDE) {
+          // k === 0 means no held state, so a delimiter contained in this
+          // buffer can be settled by indexOf plus a direct compare. Only one
+          // straddling the end needs the matcher.
+          if (this.openM.k === 0) {
+            const open = this.openBytes;
+            const len = open.length;
+            let matched = false;
+            for (;;) {
+              const idx = src.indexOf(this.openFirst, this.i);
+              if (idx < 0 || idx >= end) {
+                this.i = end;
+                break;
+              }
+              if (idx + len > end) {
+                this.i = idx;
+                break;
+              }
+              let m = 1;
+              while (m < len && src[idx + m] === open[m]) m++;
+              if (m === len) {
+                this.i = idx + len - 1;
+                this.startToken();
+                matched = true;
+                break;
+              }
+              this.i = idx + 1;
+            }
+            if (this.i >= end) break;
+            if (matched) {
+              this.i++;
+              continue;
+            }
+          }
+        } else if (this.closeM.k === 0 && this.validate === undefined) {
+          // No validator: bulk-copy up to the next possible closePat start.
+          const j = this.findClose(src, this.i, end);
+          if (j > this.i) {
+            this.ensureScratch(this.payloadLen + (j - this.i));
+            copyBytes(this.payload, this.payloadLen, src, this.i, j);
+            this.payloadLen += j - this.i;
+            this.i = j;
+            continue;
+          }
+        }
+
+        this.step(src[this.i]);
+        if (this.suspended) return;
+        if (this.restarted) {
+          this.restarted = false;
+          continue;
+        }
+        this.i++;
+      }
+
+      if (!this.inQueue) return;
+      this.leaveQueue();
+    }
+  }
+
+  /** Park the chunk cursor and scan the queue in its place. */
+  private enterQueue(): void {
+    this.chunkI = this.i;
+    this.chunkFlushStart = this.flushStart;
+    this.inQueue = true;
+    this.enter(this.queue, this.queueLen, true, 0, 0);
+  }
+
+  private leaveQueue(): void {
+    this.park();
+    this.inQueue = false;
+    this.queueLen = 0;
+    // The byte that filled the queue is consumed; carry on past it.
+    this.enter(this.chunk, this.chunk.length, false, this.chunkI + 1, this.chunkFlushStart);
+  }
+
+  /** End of a buffer: emit the settled span. Candidacy bytes still inside it
+   *  become virtual. */
+  private park(): void {
+    if (this.state !== OUTSIDE) return;
+    // IN_TOKEN: in-token bytes are never part of a pending span.
+    const k = this.openM.k;
+    if (k > 0) {
+      this.flushSpan(this.srcEnd - (k - this.carry));
+      this.carry = k;
+    } else {
+      this.flushSpan(this.srcEnd);
+    }
   }
 
   flush(ctrl: Controller): void {
@@ -233,9 +275,8 @@ export class Substituter {
         this.startToken();
         return;
       }
+      // Either way the byte stays inside the current buffer's pending span.
       this.releaseOpen(this.openM.released);
-      if (res === REJECTED) this.contentByte(byte);
-      else if (this.draining) this.carry++;
       return;
     }
 
@@ -267,12 +308,8 @@ export class Substituter {
   }
 
   private startToken(): void {
-    if (this.draining) {
-      this.flushDrain();
-    } else {
-      this.flushSpan(this.i + 1 - (this.openBytes.length - this.carry));
-      this.flushStart = this.i + 1;
-    }
+    this.flushSpan(this.i + 1 - (this.openBytes.length - this.carry));
+    this.flushStart = this.i + 1;
     this.carry = 0;
     this.state = IN_TOKEN;
     this.payloadLen = 0;
@@ -301,8 +338,7 @@ export class Substituter {
 
   /** Emit a resolved token and leave the scanner outside it. */
   protected completeToken(value: Uint8Array | null): void {
-    if (this.draining) this.flushDrain();
-    else this.flushStart = this.i + 1;
+    this.flushStart = this.i + 1;
 
     if (value === null) {
       // Null is atomic: verbatim, and the span is not re-scanned.
@@ -322,10 +358,8 @@ export class Substituter {
    *  the cursor the suspended loop was about to advance. */
   protected resume(value: Uint8Array | null): void {
     this.suspended = false;
-    const inDrain = this.draining;
     this.completeToken(value);
-    if (inDrain) this.qi++;
-    else this.i++;
+    this.i++;
     this.pump();
   }
 
@@ -340,17 +374,15 @@ export class Substituter {
    * still-held closeBytes[0..heldK), then `trailing` if >= 0.
    *
    * The queue scratch is reused: the unconsumed old suffix moves first
-   * (copyWithin is a memmove), then the head is overwritten. queueGen tells
-   * drain() to restart its cursor.
+   * (copyWithin is a memmove), then the head is overwritten.
    */
   private abortToken(from: number, released: number, heldK: number, trailing: number): void {
-    if (this.draining) this.flushDrain();
-    else this.flushStart = this.i + 1;
+    this.flushStart = this.i + 1;
     this.out.emit(this.openBytes);
     if (this.stats !== undefined) this.stats.aborted++;
 
-    const rest = this.draining ? this.queueLen - this.qi - 1 : 0;
-    const restStart = this.qi + 1;
+    const rest = this.inQueue ? this.queueLen - this.i - 1 : 0;
+    const restStart = this.i + 1;
     const tailLen = released - from + heldK + (trailing >= 0 ? 1 : 0);
     const head = this.payloadLen + tailLen;
     const q = (this.queue = requeue(this.queue, head, rest, restStart, 0));
@@ -361,75 +393,10 @@ export class Substituter {
 
     this.endToken();
     this.queueLen = head + rest;
-    this.qi = 0;
-    this.queueGen++;
-  }
-
-  /** Drive queued bytes through the scanner before consuming more input.
-   *  Mirrors the pump() fast paths, with content going to drainBuf instead
-   *  of a pending span. Bulk paths only bypass step() for bytes that provably
-   *  cannot advance a matcher, so carried state stays identical. */
-  private drain(): void {
-    this.draining = true;
-    const openPat = this.openBytes;
-    const openLen = openPat.length;
-    while (this.qi < this.queueLen) {
-      const q = this.queue;
-      const len = this.queueLen;
-      if (this.state === OUTSIDE) {
-        if (this.openM.k === 0) {
-          const start = this.qi;
-          let scan = start;
-          let matched = false;
-          let stop = len;
-          for (;;) {
-            const idx = q.indexOf(this.openFirst, scan);
-            if (idx < 0 || idx >= len) break;
-            if (idx + openLen > len) {
-              stop = idx;
-              break;
-            }
-            let m = 1;
-            while (m < openLen && q[idx + m] === openPat[m]) m++;
-            if (m === openLen) {
-              stop = idx;
-              matched = true;
-              break;
-            }
-            scan = idx + 1;
-          }
-          this.drainRange(q, start, stop);
-          if (matched) {
-            this.qi = stop + openLen;
-            this.startToken();
-            continue;
-          }
-          this.qi = stop;
-          if (stop >= len) continue;
-          // A candidate straddles the queue end: resolve it per byte.
-        }
-      } else if (this.closeM.k === 0 && this.validate === undefined) {
-        const j = this.findClose(q, this.qi, len);
-        if (j > this.qi) {
-          this.ensureScratch(this.payloadLen + (j - this.qi));
-          copyBytes(this.payload, this.payloadLen, q, this.qi, j);
-          this.payloadLen += j - this.qi;
-          this.qi = j;
-          continue;
-        }
-      }
-
-      const gen = this.queueGen;
-      this.step(q[this.qi]);
-      // Suspended: qi stays put, and resume() advances it. finishToken never
-      // rewrites the queue, so the generation cannot have moved either.
-      if (this.suspended) return;
-      if (this.queueGen === gen) this.qi++;
-    }
-    this.flushDrain();
-    this.draining = false;
-    this.queueLen = 0;
-    this.qi = 0;
+    // Already inside the queue means the buffer was just replaced: restart on it.
+    if (this.inQueue) this.enter(this.queue, this.queueLen, true, 0, 0);
+    else this.enterQueue();
+    this.restarted = true;
   }
 
   /** First closeFirst in src[from..end), clamped to the cap: bytes past `room`
@@ -480,51 +447,25 @@ export class Substituter {
     this.payloadViews.length = 0;
   }
 
-  /** A byte that is ordinary content. In a chunk it stays covered by the pending
-   *  span; off the queue it has no backing chunk, so it is buffered. */
-  private contentByte(byte: number): void {
-    if (this.draining) {
-      this.ensureDrain(this.drainLen + 1);
-      this.drainBuf[this.drainLen++] = byte;
-    }
-  }
-
-  private drainRange(src: Uint8Array, start: number, end: number): void {
-    if (end <= start) return;
-    this.ensureDrain(this.drainLen + (end - start));
-    this.drainLen = copyBytes(this.drainBuf, this.drainLen, src, start, end);
-  }
-
-  private ensureDrain(need: number): void {
-    this.drainBuf = grow(this.drainBuf, this.drainLen, need, 32);
-  }
-
   /** Emit held open bytes that no longer belong to a candidacy, oldest first.
    *  Only the virtual ones: the rest are still inside the pending span. */
   private releaseOpen(released: number): void {
     const count = released < this.carry ? released : this.carry;
     if (count === 0) return;
-    if (this.draining) {
-      this.drainRange(this.openBytes, 0, count);
-    } else {
-      this.out.emit(this.openBytes.subarray(0, count));
-    }
+    this.out.emit(this.openBytes.subarray(0, count));
     this.carry -= count;
   }
 
+  /** A buffer the scanner reuses is copied out of; a caller's chunk is enqueued
+   *  by reference. */
   private flushSpan(end: number): void {
     if (end > this.flushStart) {
-      this.out.emit(this.chunk.subarray(this.flushStart, end));
+      const src = this.src;
+      this.out.emit(
+        this.srcOwned ? src.slice(this.flushStart, end) : src.subarray(this.flushStart, end),
+      );
       this.flushStart = end;
     }
-  }
-
-  /** The copy is required: drainBuf is scratch and may be rewritten before the
-   *  accumulator flushes, and with flushBytes 0 the part is enqueued as-is. */
-  private flushDrain(): void {
-    if (this.drainLen === 0) return;
-    this.out.emit(this.drainBuf.slice(0, this.drainLen));
-    this.drainLen = 0;
   }
 
   private endToken(): void {
@@ -538,12 +479,14 @@ export class Substituter {
   private reset(): void {
     this.endToken();
     this.chunk = EMPTY;
+    this.src = EMPTY;
+    this.srcEnd = 0;
+    this.i = 0;
+    this.flushStart = 0;
     this.queue = EMPTY;
     this.queueLen = 0;
-    this.qi = 0;
-    this.drainBuf = EMPTY;
-    this.drainLen = 0;
-    this.draining = false;
+    this.inQueue = false;
+    this.restarted = false;
     this.out.reset();
   }
 }
