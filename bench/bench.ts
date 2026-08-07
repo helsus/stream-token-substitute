@@ -33,14 +33,20 @@ const options: TokenTransformOptions = {
 };
 
 const input = makeDocument();
-const chunks: Uint8Array[] = [];
-for (let i = 0; i < input.length; i += CHUNK_SIZE) chunks.push(input.subarray(i, i + CHUNK_SIZE));
 
-function source(): ReadableStream<Uint8Array> {
+function cut(size: number): Uint8Array[] {
+  const parts: Uint8Array[] = [];
+  for (let i = 0; i < input.length; i += size) parts.push(input.subarray(i, i + size));
+  return parts;
+}
+
+const chunks = cut(CHUNK_SIZE);
+
+function source(parts: Uint8Array[] = chunks): ReadableStream<Uint8Array> {
   let i = 0;
   return new ReadableStream({
     pull(controller) {
-      if (i < chunks.length) controller.enqueue(chunks[i++]);
+      if (i < parts.length) controller.enqueue(parts[i++]);
       else controller.close();
     },
   });
@@ -48,8 +54,8 @@ function source(): ReadableStream<Uint8Array> {
 
 /** Returns the number of enqueued output parts: one object plus one read() and
  *  one microtask each, which is where "many small allocations" actually hurts. */
-async function drain(flushBytes: number): Promise<number> {
-  const reader = source()
+async function drain(flushBytes: number, feed?: Uint8Array[]): Promise<number> {
+  const reader = source(feed)
     .pipeThrough(createTokenTransformStream({ ...options, flushBytes }))
     .getReader();
   let parts = 0;
@@ -87,18 +93,27 @@ console.log(
   `${input.length} bytes, ${TOKENS + 1} tokens, ${chunks.length} chunks of ${CHUNK_SIZE}`,
 );
 
+// Smaller chunks put more tokens across a boundary, which is what the carried
+// scan state costs.
+const SIZES = [1024, 64, 8];
+const cuts = new Map(SIZES.map((size) => [size, cut(size)]));
+const sizeLabel = (size: number) => `stream, ${size}B chunks`;
+
 barplot(() => {
   summary(() => {
     bench("buffer + String.replace", () => stringReplace()).gc("inner");
     bench("stream, flushBytes 0", () => drain(0)).gc("inner");
     bench("stream, flushBytes 16384", () => drain(16384)).gc("inner");
+    for (const size of SIZES) {
+      bench(sizeLabel(size), () => drain(16384, cuts.get(size) as Uint8Array[])).gc("inner");
+    }
   });
 });
 
 const stats = await run();
 
-const firstByte = async (flushBytes: number) => {
-  const reader = source()
+const firstByte = async (flushBytes: number, feed?: Uint8Array[]) => {
+  const reader = source(feed)
     .pipeThrough(createTokenTransformStream({ ...options, flushBytes }))
     .getReader();
   await reader.read();
@@ -118,6 +133,12 @@ const partsOf = new Map([
   ["stream, flushBytes 0", await drain(0)],
   ["stream, flushBytes 16384", await drain(16384)],
 ]);
+
+for (const size of SIZES) {
+  const parts = cuts.get(size) as Uint8Array[];
+  ttfbOf.set(sizeLabel(size), await ttfb(() => firstByte(16384, parts)));
+  partsOf.set(sizeLabel(size), await drain(16384, parts));
+}
 
 const round = (value: number, places: number) => Number(value.toFixed(places));
 

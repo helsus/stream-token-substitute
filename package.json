@@ -61,6 +61,7 @@
     "test:watch": "vitest",
     "test:gc": "NODE_OPTIONS=--expose-gc vitest run test/streaming.test.ts",
     "bench": "node bench/bench.ts",
+    "bench:needles": "node bench/needles.ts",
     "typecheck": "tsc --noEmit && tsc -p runtime --noEmit",
     "lint": "biome check .",
     "format": "biome check --write .",
