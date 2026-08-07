@@ -93,6 +93,11 @@ const transformer = createNeedleTransformStream({
 across requests with `compileNeedles(...)` at module scope: it is the only per-stream cost that
 grows with the set.
 
+Matching is on bytes, not characters: no Unicode normalization, so needles and body must agree on
+composition. Duplicates keep the first entry. A set large enough to need more than
+`DEFAULT_MAX_TABLE_BYTES` (16 MiB) of transition table is refused at compile time rather than at
+request time; pass `maxTableBytes` to raise or lower that.
+
 ## API
 
 Six entrypoints. The core carries nothing the others add.
@@ -100,7 +105,7 @@ Six entrypoints. The core carries nothing the others add.
 | import | exports |
 |---|---|
 | `stream-token-substitute` | `createTokenTransformStream`, `createTokenTransformer`, `jsonEscapeBytes` |
-| `stream-token-substitute/needles` | `createNeedleTransformStream`, `createNeedleTransformer`, `compileNeedles` |
+| `stream-token-substitute/needles` | `createNeedleTransformStream`, `createNeedleTransformer`, `compileNeedles`, `DEFAULT_MAX_TABLE_BYTES` |
 | `stream-token-substitute/async` | `createAsyncTokenTransformStream`, `createAsyncTokenTransformer` |
 | `stream-token-substitute/html` | `htmlEscapeBytes`, `attrEscapeBytes` |
 | `stream-token-substitute/helpers` | `resolveFrom`, `substituteResponse` |
@@ -258,7 +263,7 @@ npm test               # units, properties, differential fuzz, security, portabi
 npm run test:fuzz      # FUZZ_SEED=12345 FUZZ_ROUNDS=2000 to override
 npm run test:workers   # the same contract checks under workerd
 npm run test:bun       # test:deno for the other runtimes
-npm run bench          # bench:workers for output shape and the memory ceiling
+npm run bench          # bench:needles, bench:workers for the other paths
 ```
 
 ## License
