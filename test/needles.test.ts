@@ -99,6 +99,22 @@ describe("needles", () => {
     expect(await one("tail __I", { needles: { __ID__: "!" } })).toBe("tail __I");
   });
 
+  it("bridges a needle spread over chunks smaller than itself", async () => {
+    const needle = "N".repeat(64);
+    const input = bytes(`a${needle}b`);
+    const chunks: Uint8Array[] = [];
+    for (let i = 0; i < input.length; i += 3) chunks.push(input.subarray(i, i + 3));
+    expect(await run(chunks, { needles: { [needle]: "!" } })).toBe("a!b");
+  });
+
+  it("keeps the first entry for a duplicate needle", async () => {
+    const options: NeedleTransformOptions = {
+      needles: ["dup", "dup"],
+      resolve: (_needle, index) => bytes(`${index}`),
+    };
+    expect(await one("dup", options)).toBe("0");
+  });
+
   it("accepts an array with a resolver", async () => {
     const options: NeedleTransformOptions = {
       needles: ["one", "two"],
@@ -136,6 +152,27 @@ describe("needles", () => {
     expect(() => createNeedleTransformStream({ needles: { a: "b" }, flushBytes: -1 })).toThrow(
       RangeError,
     );
+  });
+
+  it("refuses a needle set whose transition table would be too large", () => {
+    // 300 needles of 150 distinct-ish bytes: enough states times byte classes
+    // to blow past the cap, and it must throw rather than allocate.
+    const wide: string[] = [];
+    for (let n = 0; n < 300; n++) {
+      let needle = "";
+      for (let i = 0; i < 150; i++) needle += String.fromCharCode((n + i) % 256);
+      wide.push(needle);
+    }
+    expect(() => compileNeedles(wide)).toThrow(/needle set too large/);
+    // The ceiling is a policy, not a hard rule: raise it and the same set builds.
+    expect(() => compileNeedles(wide, { maxTableBytes: 256 * 1024 * 1024 })).not.toThrow();
+  });
+
+  it("validates maxTableBytes", () => {
+    expect(() => compileNeedles(["a"], { maxTableBytes: 0 })).toThrow(RangeError);
+    expect(() => compileNeedles(["a"], { maxTableBytes: 1.5 })).toThrow(RangeError);
+    // Too small for even a tiny set, so it reports rather than allocating.
+    expect(() => compileNeedles(["abc"], { maxTableBytes: 1 })).toThrow(/needle set too large/);
   });
 
   it("enqueues one part per piece at flushBytes 0", async () => {
