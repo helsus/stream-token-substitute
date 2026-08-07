@@ -1,3 +1,9 @@
+/** Default ceiling on the transition table. It is states * width cells, so a
+ *  large enough set would allocate hundreds of megabytes and take the isolate
+ *  with it. Refusing to build it beats dying at request time. Sized for the
+ *  smallest runtime that matters: a Workers isolate gets 128 MiB total. */
+export const DEFAULT_MAX_TABLE_BYTES = 16 * 1024 * 1024;
+
 /** Aho-Corasick compiled to a full DFA over byte classes: a transition is two
  *  loads and a multiply, O(1) per byte, no failure walks. The whole scan state
  *  is one int, so a partial match survives a chunk boundary. Immutable after
@@ -10,21 +16,22 @@ export class AhoCorasick {
   readonly width: number;
   /** delta[node * width + classOf[byte]] is the next node. */
   readonly delta: Uint16Array | Int32Array;
-  /** Held-byte count per node. */
-  readonly depth: Int32Array;
+  /** Held-byte count per node. Half-width where it fits: the scan loop reads
+   *  this and outLen on every byte. */
+  readonly depth: Uint16Array | Int32Array;
   /** Longest needle ending at a node, 0 when none. It starts earliest, which
    *  makes leftmost-longest decidable per byte. */
-  readonly outLen: Int32Array;
+  readonly outLen: Uint16Array | Int32Array;
   /** Index of that needle in the constructor's array, -1 when none. */
   readonly outIdx: Int32Array;
   /** Distinct first bytes, for the outside-a-match skip. */
   readonly firstBytes: Uint8Array;
-  /** The shared first byte when there is exactly one, else -1. Lets the
-   *  scanner skip with indexOf (a SIMD memchr) instead of a mask test. */
+  /** The shared first byte when there is exactly one, else -1. Lets the scanner
+   *  skip with one indexOf instead of a mask test per byte. */
   readonly soleFirstByte: number;
   readonly maxLength: number;
 
-  constructor(needles: readonly Uint8Array[]) {
+  constructor(needles: readonly Uint8Array[], maxTableBytes: number = DEFAULT_MAX_TABLE_BYTES) {
     // Trie. The per-node Maps are build-time only; the DFA replaces them.
     const next: Map<number, number>[] = [new Map()];
     const depth = [0];
@@ -101,8 +108,16 @@ export class AhoCorasick {
     for (let b = 0; b < 256; b++) {
       if (classOf[b] !== 0) byteOfClass[classOf[b]] = b;
     }
-    const delta =
-      states <= 65536 ? new Uint16Array(states * width) : new Int32Array(states * width);
+    const cells = states * width;
+    const cellBytes = states <= 65536 ? 2 : 4;
+    if (cells * cellBytes > maxTableBytes) {
+      throw new RangeError(
+        `needle set too large: ${states} states x ${width} byte classes needs ` +
+          `${cells * cellBytes} bytes of transition table, over the ` +
+          `${maxTableBytes} byte maxTableBytes limit`,
+      );
+    }
+    const delta = cellBytes === 2 ? new Uint16Array(cells) : new Int32Array(cells);
     for (let c = 1; c < width; c++) {
       delta[c] = next[0].get(byteOfClass[c]) ?? 0;
     }
@@ -117,8 +132,8 @@ export class AhoCorasick {
 
     this.width = width;
     this.delta = delta;
-    this.depth = Int32Array.from(depth);
-    this.outLen = Int32Array.from(outLen);
+    this.depth = maxLength < 65536 ? Uint16Array.from(depth) : Int32Array.from(depth);
+    this.outLen = maxLength < 65536 ? Uint16Array.from(outLen) : Int32Array.from(outLen);
     this.outIdx = Int32Array.from(outIdx);
     this.firstBytes = firstBytes;
     this.soleFirstByte = distinctFirst === 1 ? soleFirstByte : -1;
