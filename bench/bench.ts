@@ -1,6 +1,7 @@
 // Run: npm run bench
 // Answers two questions: is streaming worth it, and what should flushBytes be.
 import { barplot, bench, run, summary } from "mitata";
+import { resolveFrom } from "../src/helpers.ts";
 import { createTokenTransformStream } from "../src/transformer.ts";
 import type { TokenTransformOptions } from "../src/types.ts";
 
@@ -29,7 +30,7 @@ values.set("t0", bytes("Benchmark document"));
 const options: TokenTransformOptions = {
   open: "{{",
   close: "}}",
-  resolve: (payload) => values.get(decoder.decode(payload)) ?? null,
+  resolve: resolveFrom(values),
 };
 
 const input = makeDocument();
