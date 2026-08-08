@@ -16,7 +16,7 @@ type Controller = TransformStreamDefaultController<Uint8Array>;
 function isThenable(value: unknown): value is Promise<Uint8Array | null> {
   return (
     value !== null &&
-    typeof value === "object" &&
+    (typeof value === "object" || typeof value === "function") &&
     typeof (value as PromiseLike<unknown>).then === "function"
   );
 }
@@ -27,7 +27,7 @@ function isThenable(value: unknown): value is Promise<Uint8Array | null> {
  * The only suspend point is a completed token whose resolver returned a
  * thenable. `pump()` unwinds without advancing, the driver awaits, and
  * `resume()` re-enters with every field exactly as it was. A resolver that
- * answers synchronously never parks, so it costs one `typeof` check per token.
+ * answers synchronously never parks, so it pays only the thenable check.
  */
 class AsyncSubstituter extends Substituter {
   private pending: Promise<Uint8Array | null> | null = null;

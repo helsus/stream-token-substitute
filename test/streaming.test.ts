@@ -66,6 +66,19 @@ describe("async transformer", () => {
     expect(decoder.decode(out)).toBe("SYNC");
   });
 
+  it("awaits callable thenables", async () => {
+    const thenable = () => {};
+    // biome-ignore lint/suspicious/noThenProperty: this intentionally exercises thenable assimilation
+    Object.defineProperty(thenable, "then", {
+      value: (resolve: (value: Uint8Array) => void) => resolve(bytes("VALUE")),
+    });
+    const out = await runAsyncStream(
+      [bytes("{{name}}")],
+      asyncOptions({ resolve: () => thenable as unknown as Promise<Uint8Array> }),
+    );
+    expect(decoder.decode(out)).toBe("VALUE");
+  });
+
   it("survives a resolver that only settles on a later macrotask", async () => {
     const out = await runAsyncStream(
       [bytes("<{{name}}|{{city}}>")],
