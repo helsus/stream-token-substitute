@@ -99,6 +99,23 @@ describe("resolveFrom", () => {
     expect(decoder.decode(resolve(bytes("abc")) as Uint8Array)).toBe("4");
   });
 
+  it("resolves hash collisions", () => {
+    const resolve = resolveFrom({
+      uwxqzevt: "first",
+      rlttrteo: "second",
+      aaaaaaaa: "a",
+      bbbbbbbb: "b",
+      cccccccc: "c",
+      dddddddd: "d",
+      eeeeeeee: "e",
+      ffffffff: "f",
+      gggggggg: "g",
+    });
+    expect(decoder.decode(resolve(bytes("uwxqzevt")) as Uint8Array)).toBe("first");
+    expect(decoder.decode(resolve(bytes("rlttrteo")) as Uint8Array)).toBe("second");
+    expect(resolve(bytes("zzzzzzzz"))).toBeNull();
+  });
+
   it("accepts a Map and Uint8Array values", () => {
     const resolve = resolveFrom(new Map([["k", bytes("V")]]));
     expect(decoder.decode(resolve(bytes("k")) as Uint8Array)).toBe("V");

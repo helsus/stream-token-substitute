@@ -23,13 +23,22 @@ interface Entry {
   value: Uint8Array;
 }
 
+const HASH_BUCKET_THRESHOLD = 8;
+
+function hashBytes(bytes: Uint8Array): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) {
+    hash = Math.imul(hash ^ bytes[i], 0x01000193);
+  }
+  return hash >>> 0;
+}
+
 /**
  * A resolver over a fixed set of names.
  *
- * Keys are matched as bytes, bucketed by length, so a lookup is a byte compare
- * against the few keys of the right length. That skips the `TextDecoder.decode`
- * per token that the hand-rolled Map version pays, and with it the string
- * allocation. Unknown names resolve to null, which emits them verbatim.
+ * Keys are matched as bytes, linearly in small length buckets and by hash in
+ * larger ones. That skips the `TextDecoder.decode` and string allocation per
+ * token. Unknown names resolve to null, which emits them verbatim.
  */
 export function resolveFrom(
   values: Record<string, string | Uint8Array> | Map<string, string | Uint8Array>,
@@ -37,23 +46,41 @@ export function resolveFrom(
   const entries: [string, string | Uint8Array][] =
     values instanceof Map ? [...values] : Object.entries(values);
 
-  const byLength = new Map<number, Entry[]>();
+  const entriesByLength = new Map<number, Entry[]>();
   for (const [name, value] of entries) {
     const key = encode(name);
     const bytes = typeof value === "string" ? encode(value) : new Uint8Array(value);
-    const bucket = byLength.get(key.length);
-    if (bucket === undefined) byLength.set(key.length, [{ key, value: bytes }]);
+    const bucket = entriesByLength.get(key.length);
+    if (bucket === undefined) entriesByLength.set(key.length, [{ key, value: bytes }]);
     else bucket.push({ key, value: bytes });
+  }
+
+  const byLength = new Map<number, Entry[] | Map<number, Entry[]>>();
+  for (const [length, bucket] of entriesByLength) {
+    if (bucket.length <= HASH_BUCKET_THRESHOLD) {
+      byLength.set(length, bucket);
+      continue;
+    }
+    const byHash = new Map<number, Entry[]>();
+    for (const entry of bucket) {
+      const hash = hashBytes(entry.key);
+      const collisions = byHash.get(hash);
+      if (collisions === undefined) byHash.set(hash, [entry]);
+      else collisions.push(entry);
+    }
+    byLength.set(length, byHash);
   }
 
   return (payload) => {
     const bucket = byLength.get(payload.length);
     if (bucket === undefined) return null;
-    for (let e = 0; e < bucket.length; e++) {
-      const key = bucket[e].key;
+    const candidates = bucket instanceof Map ? bucket.get(hashBytes(payload)) : bucket;
+    if (candidates === undefined) return null;
+    for (let e = 0; e < candidates.length; e++) {
+      const key = candidates[e].key;
       let i = 0;
       while (i < key.length && key[i] === payload[i]) i++;
-      if (i === key.length) return bucket[e].value;
+      if (i === key.length) return candidates[e].value;
     }
     return null;
   };
