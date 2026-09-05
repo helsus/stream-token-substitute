@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { AhoCorasick } from "../src/aho-corasick.ts";
 import {
   compileNeedles,
+  createNeedleTransformer,
   createNeedleTransformStream,
   type NeedleStats,
   type NeedleTransformOptions,
@@ -287,5 +289,162 @@ describe("compileNeedles", () => {
   it("validates at compile time, not per stream", () => {
     expect(() => compileNeedles([])).toThrow(TypeError);
     expect(() => compileNeedles([""])).toThrow(TypeError);
+  });
+});
+
+describe("needle boundaries and table limits", () => {
+  it("matches randomized sets after switching to the rolling index", () => {
+    const rnd = prng(20260907);
+    const word = (length: number) =>
+      Uint8Array.from({ length }, () => [97, 98, 120, 0, 255][Math.floor(rnd() * 5)]);
+    for (let round = 0; round < 40; round++) {
+      const patterns = [
+        bytes("a"),
+        bytes(`${"a".repeat(300 + Math.floor(rnd() * 500))}b`),
+        ...Array.from({ length: 8 }, () => word(1 + Math.floor(rnd() * 12))),
+      ];
+      const options = {
+        needles: compileNeedles(patterns),
+        resolve: (_: Uint8Array, index: number) =>
+          index % 3 === 0 ? null : new Uint8Array(index % 3).fill(index),
+      };
+      const input = concat([
+        bytes("a".repeat(2000)),
+        word(2000),
+        ...patterns,
+        bytes("a".repeat(1000)),
+      ]);
+      const expected = substituteNeedles(input, options);
+      for (const size of [1, 17, input.length]) {
+        const parts: Uint8Array[] = [];
+        const ctrl = {
+          enqueue: (part: Uint8Array) => parts.push(part),
+        } as unknown as TransformStreamDefaultController<Uint8Array>;
+        const body = createNeedleTransformer(options);
+        for (let at = 0; at < input.length; at += size)
+          body.transform(input.subarray(at, at + size), ctrl);
+        body.flush(ctrl);
+        expect(hex(concat(parts))).toBe(hex(expected));
+      }
+    }
+  });
+
+  it("indexes long overlaps across chunks and ring wraps", () => {
+    const long = `${"a".repeat(4096)}b`;
+    const input = bytes(`${"a".repeat(150000)}b${"a".repeat(10000)}`);
+    const expected = `${"X".repeat(150000 - 4096)}Y${"X".repeat(10000)}`;
+    const needles = compileNeedles({ a: "X", [long]: "Y" });
+    for (const size of [1, 7, 1024, 65536, input.length]) {
+      const parts: Uint8Array[] = [];
+      const ctrl = {
+        enqueue: (part: Uint8Array) => parts.push(part),
+      } as unknown as TransformStreamDefaultController<Uint8Array>;
+      const body = createNeedleTransformer({ needles });
+      for (let at = 0; at < input.length; at += size)
+        body.transform(input.subarray(at, at + size), ctrl);
+      body.flush(ctrl);
+      expect(decoder.decode(concat(parts))).toBe(expected);
+    }
+  });
+
+  it("keeps leftmost matches and duplicate precedence in the indexed path", () => {
+    const needles = ["a", "ab", "b", `${"a".repeat(2048)}b`, "ab", `${"ba".repeat(1024)}c`];
+    const options = {
+      needles: compileNeedles(needles),
+      resolve: (_: Uint8Array, index: number) => (index === 2 ? null : bytes(String(index))),
+    };
+    const input = bytes(`${"a".repeat(5000)}b${"ba".repeat(3000)}cx${"a".repeat(3000)}`);
+    const expected = substituteNeedles(input, options);
+    for (const size of [511, input.length]) {
+      const parts: Uint8Array[] = [];
+      const ctrl = {
+        enqueue: (part: Uint8Array) => parts.push(part),
+      } as unknown as TransformStreamDefaultController<Uint8Array>;
+      const body = createNeedleTransformer(options);
+      for (let at = 0; at < input.length; at += size)
+        body.transform(input.subarray(at, at + size), ctrl);
+      body.flush(ctrl);
+      expect(hex(concat(parts))).toBe(hex(expected));
+    }
+  });
+
+  it("emits a decided short needle without waiting for another chunk", () => {
+    for (const prefix of ["", "x"]) {
+      const parts: Uint8Array[] = [];
+      const body = createNeedleTransformer({ needles: { ab: "X", abcdef: "Y", q: "Z" } });
+      const ctrl = {
+        enqueue: (part: Uint8Array) => parts.push(part),
+      } as unknown as TransformStreamDefaultController<Uint8Array>;
+      body.transform(bytes(`${prefix}q`), ctrl);
+      expect(decoder.decode(concat(parts))).toBe(`${prefix}Z`);
+      body.flush(ctrl);
+      expect(decoder.decode(concat(parts))).toBe(`${prefix}Z`);
+    }
+  });
+
+  it("handles wide alphabets and the 16-bit state boundary", async () => {
+    const needle = new Uint8Array(65536);
+    for (let i = 0; i < needle.length; i++) needle[i] = i % 256;
+    const compiled = compileNeedles([needle], { maxTableBytes: 80 * 1024 * 1024 });
+    expect(
+      await run([needle.subarray(0, 65535), needle.subarray(65535)], {
+        needles: compiled,
+        resolve: () => bytes("X"),
+      }),
+    ).toBe("X");
+  });
+
+  it("matches random needle sets across chunk boundaries", async () => {
+    const rnd = prng(20260906);
+    const word = (max: number) => {
+      let result = "";
+      for (let i = 1 + Math.floor(rnd() * max); i > 0; i--) {
+        result += "abc"[Math.floor(rnd() * 3)];
+      }
+      return result;
+    };
+    for (let round = 0; round < 300; round++) {
+      const needles = Array.from({ length: 8 }, () => word(9));
+      const options = {
+        needles: compileNeedles(needles),
+        resolve: (_: Uint8Array, index: number) => bytes(String(index)),
+      };
+      const input = bytes(needles.join("") + word(30));
+      const expected = substituteNeedles(input, options);
+      for (const size of [1, 3, 16, input.length]) {
+        const chunks = [];
+        for (let at = 0; at < input.length; at += size) chunks.push(input.subarray(at, at + size));
+        expect(hex(concat(await runNeedleParts(chunks, options)))).toBe(hex(expected));
+      }
+    }
+  });
+
+  it("emits a longest-length needle without waiting for another chunk", () => {
+    const body = createNeedleTransformer({ needles: { abc: "X", def: "Y" } });
+    const parts: Uint8Array[] = [];
+    const ctrl = {
+      enqueue: (part: Uint8Array) => parts.push(part),
+    } as unknown as TransformStreamDefaultController<Uint8Array>;
+    body.transform(bytes("abc"), ctrl);
+    expect(decoder.decode(concat(parts))).toBe("X");
+    body.transform(bytes("def"), ctrl);
+    body.flush(ctrl);
+    expect(decoder.decode(concat(parts))).toBe("XY");
+  });
+
+  it("rejects an oversized trie before reading the rest of the set", () => {
+    const needles = [bytes("abcdef"), bytes("later")];
+    Object.defineProperty(needles, 1, {
+      get() {
+        throw new Error("read past budget");
+      },
+    });
+    expect(() => new AhoCorasick(needles, 8)).toThrow(/needle set too large/);
+  });
+
+  it("applies the table budget exactly, including new byte classes", () => {
+    // Root + a + b, three columns, two bytes per cell.
+    expect(() => compileNeedles(["a", "b"], { maxTableBytes: 18 })).not.toThrow();
+    expect(() => compileNeedles(["a", "b"], { maxTableBytes: 17 })).toThrow(RangeError);
   });
 });

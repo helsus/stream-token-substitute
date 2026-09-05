@@ -16,8 +16,7 @@ export class AhoCorasick {
   readonly width: number;
   /** delta[node * width + classOf[byte]] is the next node. */
   readonly delta: Uint16Array | Int32Array;
-  /** Held-byte count per node. Half-width where it fits: the scan loop reads
-   *  this and outLen on every byte. */
+  /** Longest suffix that can still extend to a needle. */
   readonly depth: Uint16Array | Int32Array;
   /** Longest needle ending at a node, 0 when none. It starts earliest, which
    *  makes leftmost-longest decidable per byte. */
@@ -30,13 +29,12 @@ export class AhoCorasick {
    *  skip with one indexOf instead of a mask test per byte. */
   readonly soleFirstByte: number;
   readonly maxLength: number;
+  readonly fail: Uint32Array;
 
   constructor(needles: readonly Uint8Array[], maxTableBytes: number = DEFAULT_MAX_TABLE_BYTES) {
-    // Trie. The per-node Maps are build-time only; the DFA replaces them.
-    const next: Map<number, number>[] = [new Map()];
-    const depth = [0];
-    const outLen = [0];
-    const outIdx = [-1];
+    // Five cells per node: child, sibling, byte, depth, match index + 1.
+    let trie = new Uint32Array(5 * 16);
+    let states = 1;
     const classOf = this.classOf;
     const firstBytes = new Uint8Array(256);
     let distinctFirst = 0;
@@ -56,85 +54,73 @@ export class AhoCorasick {
       for (let i = 0; i < needle.length; i++) {
         const byte = needle[i];
         if (classOf[byte] === 0) classOf[byte] = width++;
-        let child = next[node].get(byte);
-        if (child === undefined) {
-          child = next.length;
-          next.push(new Map());
-          depth.push(depth[node] + 1);
-          outLen.push(0);
-          outIdx.push(-1);
-          next[node].set(byte, child);
+        let child = trie[node * 5];
+        while (child !== 0 && trie[child * 5 + 2] !== byte) child = trie[child * 5 + 1];
+        if (child === 0) {
+          child = states;
+          const count = states + 1;
+          const tableBytes = count * width * (count <= 65536 ? 2 : 4);
+          if (tableBytes > maxTableBytes) {
+            throw new RangeError(
+              `needle set too large: ${count} states x ${width} byte classes needs ` +
+                `${tableBytes} bytes of transition table, over the ` +
+                `${maxTableBytes} byte maxTableBytes limit`,
+            );
+          }
+          if (count * 5 > trie.length) {
+            const grown = new Uint32Array(trie.length * 2);
+            grown.set(trie);
+            trie = grown;
+          }
+          states = count;
+          trie[child * 5 + 1] = trie[node * 5];
+          trie[child * 5 + 2] = byte;
+          trie[child * 5 + 3] = trie[node * 5 + 3] + 1;
+          trie[node * 5] = child;
         }
         node = child;
       }
       // A duplicate needle keeps the first entry.
-      if (outIdx[node] === -1) {
-        outLen[node] = needle.length;
-        outIdx[node] = p;
-      }
+      if (trie[node * 5 + 4] === 0) trie[node * 5 + 4] = p + 1;
     }
 
-    // Failure links, BFS. Children inherit the longest suffix needle, which
-    // collapses the output-link walk.
-    const states = next.length;
-    const fail = new Int32Array(states);
-    const queue: number[] = [];
-    for (const child of next[0].values()) queue.push(child);
-    for (let head = 0; head < queue.length; head++) {
-      const node = queue[head];
-      for (const [byte, child] of next[node]) {
-        let f = fail[node];
-        for (;;) {
-          const t = next[f].get(byte);
-          if (t !== undefined) {
-            fail[child] = t;
-            break;
-          }
-          if (f === 0) break;
-          f = fail[f];
-        }
-        if (outIdx[child] === -1) {
-          const link = fail[child];
-          outLen[child] = outLen[link];
-          outIdx[child] = outIdx[link];
-        }
-        queue.push(child);
-      }
-    }
-
-    // DFA: resolve every (state, class) once. BFS order guarantees the fail
-    // row is complete before any row that reads it.
-    const byteOfClass = new Uint8Array(width);
-    for (let b = 0; b < 256; b++) {
-      if (classOf[b] !== 0) byteOfClass[classOf[b]] = b;
-    }
+    // BFS builds failure links and DFA rows together.
+    const fail = new Uint32Array(states);
+    this.fail = fail;
+    const queue = new Uint32Array(states - 1);
+    const depth = maxLength < 65536 ? new Uint16Array(states) : new Int32Array(states);
+    const outLen = maxLength < 65536 ? new Uint16Array(states) : new Int32Array(states);
+    const outIdx = new Int32Array(states).fill(-1);
     const cells = states * width;
     const cellBytes = states <= 65536 ? 2 : 4;
-    if (cells * cellBytes > maxTableBytes) {
-      throw new RangeError(
-        `needle set too large: ${states} states x ${width} byte classes needs ` +
-          `${cells * cellBytes} bytes of transition table, over the ` +
-          `${maxTableBytes} byte maxTableBytes limit`,
-      );
-    }
     const delta = cellBytes === 2 ? new Uint16Array(cells) : new Int32Array(cells);
-    for (let c = 1; c < width; c++) {
-      delta[c] = next[0].get(byteOfClass[c]) ?? 0;
+    let tail = 0;
+    for (let child = trie[0]; child !== 0; child = trie[child * 5 + 1]) {
+      delta[classOf[trie[child * 5 + 2]]] = child;
+      queue[tail++] = child;
     }
-    for (let head = 0; head < queue.length; head++) {
+    for (let head = 0; head < tail; head++) {
       const s = queue[head];
       const row = s * width;
       const failRow = fail[s] * width;
-      for (let c = 1; c < width; c++) {
-        delta[row + c] = next[s].get(byteOfClass[c]) ?? delta[failRow + c];
+      delta.copyWithin(row, failRow, failRow + width);
+      const match = trie[s * 5 + 4];
+      outLen[s] = match === 0 ? outLen[fail[s]] : trie[s * 5 + 3];
+      outIdx[s] = match === 0 ? outIdx[fail[s]] : match - 1;
+      depth[s] = trie[s * 5] === 0 ? depth[fail[s]] : trie[s * 5 + 3];
+      for (let child = trie[s * 5]; child !== 0; child = trie[child * 5 + 1]) {
+        const c = classOf[trie[child * 5 + 2]];
+        fail[child] = delta[failRow + c];
+        delta[row + c] = child;
+        queue[tail++] = child;
       }
     }
 
     this.width = width;
     this.delta = delta;
-    this.depth = maxLength < 65536 ? Uint16Array.from(depth) : Int32Array.from(depth);
-    this.outLen = maxLength < 65536 ? Uint16Array.from(outLen) : Int32Array.from(outLen);
-    this.outIdx = Int32Array.from(outIdx);
+    this.depth = depth;
+    this.outLen = outLen;
+    this.outIdx = outIdx;
     this.firstBytes = firstBytes;
     this.soleFirstByte = distinctFirst === 1 ? soleFirstByte : -1;
     this.maxLength = maxLength;

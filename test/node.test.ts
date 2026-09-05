@@ -6,7 +6,7 @@ import {
   createNeedleTransform,
   createTokenTransform,
 } from "../src/node.ts";
-import { bytes, decoder } from "./helpers.ts";
+import { bytes, decoder, deferred } from "./helpers.ts";
 
 const values = new Map([
   ["name", bytes("world")],
@@ -24,6 +24,84 @@ async function collect(stream: NodeJS.ReadableStream): Promise<string> {
 const source = (parts: string[]) => Readable.from(parts.map((part) => Buffer.from(part)));
 
 describe("node adapter", () => {
+  it("pauses before resolving a needle behind a large prefix", async () => {
+    let calls = 0;
+    const stream = createNeedleTransform(
+      {
+        needles: ["{{x}}"],
+        resolve: () => {
+          calls++;
+          return bytes("X");
+        },
+      },
+      { highWaterMark: 1024 },
+    );
+    const available = new Promise<void>((done) => stream.once("readable", done));
+    stream.end(bytes(`${"a".repeat(65536)}{{x}}`));
+    await available;
+    expect(calls).toBe(0);
+    expect((await collect(stream)).length).toBe(65537);
+    expect(calls).toBe(1);
+  });
+
+  for (const mode of ["sync", "async", "needles", "needle flush"] as const) {
+    it(`pauses ${mode} expansion at the readable high-water mark`, async () => {
+      let calls = 0;
+      const resolve = () => {
+        calls++;
+        return new Uint8Array(65536).fill(88);
+      };
+      const options = { open: "{{", close: "}}", resolve };
+      const streamOptions = { highWaterMark: 1024 };
+      const stream =
+        mode === "sync"
+          ? createTokenTransform(options, streamOptions)
+          : mode === "async"
+            ? createAsyncTokenTransform(
+                { ...options, resolve: async () => resolve() },
+                streamOptions,
+              )
+            : createNeedleTransform(
+                { needles: mode === "needle flush" ? ["a", "aab"] : ["{{x}}"], resolve },
+                streamOptions,
+              );
+      const available = new Promise<void>((done) => stream.once("readable", done));
+      stream.end(bytes(mode === "needle flush" ? "aa" : "{{x}}".repeat(100)));
+      await available;
+      await new Promise((done) => setTimeout(done, 0));
+      expect(calls).toBe(1);
+      expect(stream.readableLength).toBe(65536);
+      let total = 0;
+      for await (const part of stream) total += part.length;
+      expect(calls).toBe(mode === "needle flush" ? 2 : 100);
+      expect(total).toBe(calls * 65536);
+    });
+  }
+
+  for (const reason of [undefined, null, false, 0, "", "failure"]) {
+    for (const mode of ["sync", "async", "needles", "flush"] as const) {
+      it(`propagates ${mode} failures with reason ${String(reason)}`, async () => {
+        const fail = () => {
+          throw reason;
+        };
+        const options = { open: "{{", close: "}}", resolve: fail };
+        const transform =
+          mode === "async"
+            ? createAsyncTokenTransform({ ...options, resolve: () => Promise.reject(reason) })
+            : mode === "needles"
+              ? createNeedleTransform({ needles: ["{{x}}"], resolve: fail })
+              : createTokenTransform(
+                  mode === "flush" ? { ...options, resolve: () => null, onDone: fail } : options,
+                );
+        await expect(
+          pipeline(source(["{{x}}"]), transform, async (output) => {
+            for await (const _ of output);
+          }),
+        ).rejects.toMatchObject({ message: "substitution failed", cause: reason });
+      });
+    }
+  }
+
   it("substitutes tokens through a pipe", async () => {
     const out = await collect(
       source(["hello {{name}}, ", "you are {{n}}"]).pipe(
@@ -170,5 +248,32 @@ describe("node adapter", () => {
       process.off("uncaughtException", onUncaught);
     }
     expect(uncaught).toEqual([]);
+  });
+
+  it("settles a Node write on destroy with its resolver still pending", async () => {
+    const gate = deferred<Uint8Array | null>();
+    const started = deferred<void>();
+    let calls = 0;
+    const stream = createAsyncTokenTransform({
+      open: "{{",
+      close: "}}",
+      resolve: () => {
+        calls++;
+        started.resolve();
+        return gate.promise;
+      },
+    });
+    stream.on("error", () => {});
+    const written = new Promise<Error | null | undefined>((done) => {
+      stream.write(bytes("{{a}}{{b}}"), done);
+    });
+    await started.promise;
+    const closed = new Promise<void>((done) => stream.once("close", done));
+    stream.destroy();
+    await closed;
+    expect(await written).toBeInstanceOf(Error);
+    gate.resolve(null);
+    await Promise.resolve();
+    expect(calls).toBe(1);
   });
 });

@@ -21,21 +21,6 @@ export function copyBytes(
   return w + len;
 }
 
-/** Grow a scratch buffer to `need`, preserving `used` bytes. */
-export function grow(
-  buf: Uint8Array<ArrayBuffer>,
-  used: number,
-  need: number,
-  min: number,
-): Uint8Array<ArrayBuffer> {
-  if (need <= buf.length) return buf;
-  let size = buf.length === 0 ? min : buf.length * 2;
-  if (size < need) size = need;
-  const next = new Uint8Array(size);
-  next.set(buf.subarray(0, used));
-  return next;
-}
-
 /** Make room for `head` bytes at the front of a pushback queue, relocating its
  *  unconsumed tail to `head`. In place when it fits. */
 export function requeue(

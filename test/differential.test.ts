@@ -481,3 +481,113 @@ describe("substituteBytes", () => {
     ).toThrow("boom");
   });
 });
+
+describe("delimiter boundaries", () => {
+  it("finds delimiters at every position after a run of first-byte near misses", async () => {
+    for (const open of [bytes("{{"), bytes("ab"), bytes("abac"), new Uint8Array([255, 0])]) {
+      for (let padding = 0; padding < 132; padding++) {
+        const prefix = new Uint8Array(padding + 2);
+        prefix.fill((open[1] + 1) & 255);
+        prefix[0] = open[0];
+        const input = concat([prefix, open, bytes("x!")]);
+        const options = { open, close: "!", resolve: () => bytes("X") };
+        const expected = substituteBytes(input, options);
+        for (const cut of [0, input.length - 3, input.length - 2]) {
+          const chunks = splitAt(input, [cut]);
+          expect(await runStream(chunks, options)).toEqual(expected);
+        }
+      }
+    }
+  });
+
+  it("preserves CSS bytes and substitutes tokens across small chunk boundaries", async () => {
+    const input = bytes(
+      `${".a{color:red}.b{margin:0}".repeat(12)}{{a}}${"x{y:z}".repeat(12)}{{b}}{`,
+    );
+    const options = { open: "{{", close: "}}", resolve: () => bytes("X") };
+    const expected = substituteBytes(input, options);
+    for (const size of [1, 2, 3, 7, 31, 63, 64, 65, input.length]) {
+      const chunks: Uint8Array[] = [];
+      for (let i = 0; i < input.length; i += size) chunks.push(input.subarray(i, i + size));
+      expect(await runStream(chunks, options)).toEqual(expected);
+      expect(await runAsyncStream(chunks, { ...options, resolve: async () => bytes("X") })).toEqual(
+        expected,
+      );
+    }
+  });
+
+  it("preserves overlapping opening delimiters across every split", async () => {
+    for (const open of ["aaaab", "ababac", "abcabd", "aaaa", "ababa"]) {
+      const input = bytes(`!${open.repeat(3)}aaa${open}x!${open.slice(0, -1)}`);
+      const options = { open, close: "!", maxPayloadBytes: 8, resolve: () => bytes("X") };
+      const expected = substituteBytes(input, options);
+      for (let cut = 0; cut <= input.length; cut++) {
+        const chunks = splitAt(input, [cut]);
+        expect(await runStream(chunks, options)).toEqual(expected);
+        expect(
+          await runAsyncStream(chunks, { ...options, resolve: async () => bytes("X") }),
+        ).toEqual(expected);
+      }
+    }
+  });
+
+  it("keeps the same payload-cap boundary on the bulk search path", async () => {
+    for (const length of [1023, 1024, 1025]) {
+      const input = bytes(`{{${"x".repeat(length)}}}{{ok}}`);
+      const options = { open: "{{", close: "}}", maxPayloadBytes: 1024, resolve: () => bytes("X") };
+      const expected = substituteBytes(input, options);
+      for (const cut of [0, 513, 1025, input.length]) {
+        expect(await runStream(splitAt(input, [cut]), options)).toEqual(expected);
+      }
+    }
+  });
+});
+
+describe("async resolver thenables", () => {
+  it("recovers when reading a resolver's then property throws", async () => {
+    const failure = new Error("then getter failed");
+    // biome-ignore lint/suspicious/noThenProperty: exercises throwing thenable getters
+    const thenable = Object.defineProperty({}, "then", {
+      get() {
+        throw failure;
+      },
+    }) as PromiseLike<Uint8Array>;
+    const seen: string[] = [];
+    const output = await runAsyncStream([bytes("{{a}}{{b}}")], {
+      open: "{{",
+      close: "}}",
+      resolve: () => thenable,
+      onResolveError: (error, payload) => {
+        expect(error).toBe(failure);
+        seen.push(decoder.decode(payload));
+        return bytes("recovered");
+      },
+    });
+    expect(decoder.decode(output)).toBe("recoveredrecovered");
+    expect(seen).toEqual(["a", "b"]);
+  });
+
+  it("reads a custom then getter once and preserves its receiver", async () => {
+    let reads = 0;
+    // biome-ignore lint/suspicious/noThenProperty: exercises stateful thenable getters
+    const thenable = Object.defineProperty({}, "then", {
+      get() {
+        if (++reads > 1) throw new Error("read twice");
+        return function (this: unknown, resolve: (value: Uint8Array) => void) {
+          expect(this).toBe(thenable);
+          resolve(bytes("OK"));
+        };
+      },
+    }) as PromiseLike<Uint8Array>;
+    expect(
+      decoder.decode(
+        await runAsyncStream([bytes("{{a}}")], {
+          open: "{{",
+          close: "}}",
+          resolve: () => thenable,
+        }),
+      ),
+    ).toBe("OK");
+    expect(reads).toBe(1);
+  });
+});

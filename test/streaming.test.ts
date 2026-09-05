@@ -2,9 +2,15 @@
 // counts, backpressure, zero-copy output and carried-state bounds.
 
 import { describe, expect, it } from "vitest";
-import { createAsyncTokenTransformStream } from "../src/async-transformer.ts";
-import { createNeedleTransformStream } from "../src/needles.ts";
-import { createTokenTransformStream } from "../src/transformer.ts";
+import {
+  createAsyncTokenStreamPair,
+  createAsyncTokenTransformer,
+  createAsyncTokenTransformStream,
+} from "../src/async-transformer.ts";
+import { substituteResponse } from "../src/helpers.ts";
+import { createTokenStreamPair as exportedTokenStreamPair } from "../src/index.ts";
+import { createNeedleStreamPair, createNeedleTransformStream } from "../src/needles.ts";
+import { createTokenStreamPair, createTokenTransformStream } from "../src/transformer.ts";
 import type {
   AsyncTokenTransformOptions,
   TokenStats,
@@ -12,8 +18,10 @@ import type {
 } from "../src/types.ts";
 import {
   bytes,
+  concat,
   decoder,
   deferResolver,
+  deferred,
   runAsyncStream,
   runAsyncStreamParts,
   runStream,
@@ -350,7 +358,149 @@ async function assertBounded(tx: TransformStream<Uint8Array, Uint8Array>): Promi
   writer.releaseLock();
 }
 
+describe("Web factory compatibility", () => {
+  it("exports the sync pair factory from the main entrypoint", () => {
+    expect(exportedTokenStreamPair).toBe(createTokenStreamPair);
+  });
+
+  for (const mode of ["sync", "async", "needles"] as const) {
+    it(`retains native ${mode} identity and transferability`, async () => {
+      const options = { open: "{{", close: "}}", resolve: () => bytes("v") };
+      const stream =
+        mode === "sync"
+          ? createTokenTransformStream(options)
+          : mode === "async"
+            ? createAsyncTokenTransformStream(options)
+            : createNeedleTransformStream({ needles: { "{{x}}": "v" } });
+      expect(stream).toBeInstanceOf(TransformStream);
+      const getter = Object.getOwnPropertyDescriptor(TransformStream.prototype, "readable")?.get;
+      if (!getter) throw new Error("missing native getter");
+      expect(getter.call(stream)).toBe(stream.readable);
+      const transferred = structuredClone(stream, { transfer: [stream] });
+      expect(transferred).toBeInstanceOf(TransformStream);
+      const result = substituteResponse(new Response("{{x}}"), transferred);
+      expect(await result.text()).toBe("v");
+    });
+
+    it(`accepts an opt-in ${mode} pair in substituteResponse`, async () => {
+      const options = { open: "{{", close: "}}", resolve: () => bytes("v") };
+      const pair =
+        mode === "sync"
+          ? createTokenStreamPair(options)
+          : mode === "async"
+            ? createAsyncTokenStreamPair(options)
+            : createNeedleStreamPair({ needles: { "{{x}}": "v" } });
+      expect(pair).not.toBeInstanceOf(TransformStream);
+      expect(await substituteResponse(new Response("{{x}}"), pair).text()).toBe("v");
+    });
+  }
+});
+
 describe("backpressure", () => {
+  for (const mode of ["sync", "async", "needles"] as const) {
+    it(`bounds ${mode} buffering with a large flushBytes setting`, async () => {
+      let calls = 0;
+      const resolve = () => {
+        calls++;
+        return new Uint8Array(99);
+      };
+      const options = { open: "{{", close: "}}", resolve, flushBytes: Number.MAX_SAFE_INTEGER };
+      const tx =
+        mode === "sync"
+          ? createTokenStreamPair(options)
+          : mode === "async"
+            ? createAsyncTokenStreamPair({ ...options, resolve: async () => resolve() })
+            : createNeedleStreamPair({
+                needles: ["{{x}}"],
+                resolve,
+                flushBytes: options.flushBytes,
+              });
+      const reader = tx.readable.getReader();
+      const writer = tx.writable.getWriter();
+      const first = reader.read();
+      const written = writer.write(bytes("{{x}}".repeat(10000))).then(() => writer.close());
+      let count = (await first).value?.length ?? 0;
+      await tick();
+      expect(calls).toBeLessThan(400);
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) break;
+        count += part.value.length;
+      }
+      await written;
+      expect(count).toBe(990000);
+      writer.releaseLock();
+      reader.releaseLock();
+    });
+  }
+
+  for (const mode of ["sync", "async", "needles", "needle flush"] as const) {
+    it(`pauses ${mode} expansion within one input chunk`, async () => {
+      let calls = 0;
+      let completed = 0;
+      const resolve = () => {
+        calls++;
+        return new Uint8Array(65536).fill(88);
+      };
+      const options = { open: "{{", close: "}}", resolve, onDone: () => completed++ };
+      const tx =
+        mode === "sync"
+          ? createTokenStreamPair(options)
+          : mode === "async"
+            ? createAsyncTokenStreamPair({ ...options, resolve: async () => resolve() })
+            : createNeedleStreamPair({
+                needles: mode === "needle flush" ? ["a", `${"a".repeat(2048)}b`] : ["{{x}}"],
+                resolve,
+                onDone: () => completed++,
+              });
+      const reader = tx.readable.getReader();
+      const writer = tx.writable.getWriter();
+      const first = reader.read();
+      let settled = false;
+      const count = mode === "needle flush" ? 2000 : 100;
+      const written = writer
+        .write(bytes((mode === "needle flush" ? "a" : "{{x}}").repeat(count)))
+        .then(() => writer.close())
+        .then(() => {
+          settled = true;
+        });
+      let total = (await first).value?.length ?? 0;
+      await tick();
+      expect(calls).toBeLessThanOrEqual(2);
+      expect(settled).toBe(false);
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) break;
+        total += part.value.length;
+      }
+      await written;
+      expect(total).toBe(count * 65536);
+      expect(calls).toBe(count);
+      expect(completed).toBe(1);
+      reader.releaseLock();
+      writer.releaseLock();
+    });
+  }
+
+  it("aborts a paused write without waiting for a reader", async () => {
+    const tx = createTokenStreamPair({
+      open: "{{",
+      close: "}}",
+      resolve: () => new Uint8Array(65536),
+    });
+    const writer = tx.writable.getWriter();
+    const reader = tx.readable.getReader();
+    const first = reader.read();
+    const written = writer.write(bytes("{{x}}".repeat(100))).catch((error) => error);
+    await first;
+    const error = new Error("stop");
+    await writer.abort(error);
+    expect(await written).toBe(error);
+    await expect(reader.read()).rejects.toBe(error);
+    writer.releaseLock();
+    reader.releaseLock();
+  });
+
   it("holds the writer while the reader is stalled", async () => {
     await assertBounded(
       createTokenTransformStream({ open: "{{", close: "}}", resolve: () => bytes("v") }),
@@ -496,7 +646,7 @@ describe("memory", () => {
     expect(stats.total).toBe(perChunk * rounds);
     // Structural, not RSS: output starts on the first chunk and no single
     // enqueue ever exceeds one chunk, so nothing accumulates across the body.
-    // bench/memory.ts measures real RSS.
+    // bench/bench.ts samples process memory.
     expect(stats.firstOutputAtWrite).toBe(0);
     expect(stats.maxPart).toBeLessThanOrEqual(chunk.length);
     expect(stats.writes).toBe(rounds);
@@ -547,5 +697,204 @@ describe("memory", () => {
     const total = parts.reduce((n, p) => n + p.length, 0);
     expect(total).toBe(chunk.length);
     expect(maxPayload).toBeLessThanOrEqual(8);
+  });
+});
+
+describe("async cancellation", () => {
+  const ctrl = { enqueue() {} } as unknown as TransformStreamDefaultController<Uint8Array>;
+
+  it("detaches pending work on readable cancellation", async () => {
+    const gate = deferred<Uint8Array | null>();
+    const started = deferred<void>();
+    const stream = createAsyncTokenTransformStream({
+      open: "{{",
+      close: "}}",
+      resolve: () => {
+        started.resolve();
+        return gate.promise;
+      },
+    });
+    const reader = stream.readable.getReader();
+    const writer = stream.writable.getWriter();
+    const read = reader.read();
+    const written = writer.write(bytes("{{a}}")).catch((reason) => reason);
+    await started.promise;
+    await reader.cancel("stop");
+    expect(await written).toBe("stop");
+    expect((await read).done).toBe(true);
+    gate.resolve(null);
+    reader.releaseLock();
+    writer.releaseLock();
+  });
+  for (const lateFailure of [false, true]) {
+    it(`detaches pending work before late ${lateFailure ? "rejection" : "fulfillment"}`, async () => {
+      const gate = deferred<Uint8Array | null>();
+      const abort = new AbortController();
+      let calls = 0;
+      let recovered = 0;
+      const body = createAsyncTokenTransformer({
+        open: "{{",
+        close: "}}",
+        signal: abort.signal,
+        resolve: () => {
+          calls++;
+          return gate.promise;
+        },
+        onResolveError: () => {
+          recovered++;
+          return null;
+        },
+      });
+      const pending = body.transform(bytes("{{a}}{{b}}"), ctrl);
+      const failure = new Error("cancelled");
+      abort.abort(failure);
+      await expect(pending).rejects.toBe(failure);
+      if (lateFailure) gate.reject(new Error("late"));
+      else gate.resolve(null);
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      expect(recovered).toBe(0);
+    });
+  }
+
+  for (const promised of [false, true]) {
+    it(`handles abort inside a ${promised ? "promised" : "direct"} resolver`, async () => {
+      const abort = new AbortController();
+      const failure = new Error("abort in resolver");
+      let calls = 0;
+      const body = createAsyncTokenTransformer({
+        open: "{{",
+        close: "}}",
+        signal: abort.signal,
+        resolve: () => {
+          calls++;
+          abort.abort(failure);
+          return promised ? Promise.reject(new Error("late")) : null;
+        },
+      });
+      await expect(body.transform(bytes("{{a}}{{b}}"), ctrl)).rejects.toBe(failure);
+      expect(calls).toBe(1);
+    });
+  }
+
+  it("preserves undefined rejection reasons", async () => {
+    const body = createAsyncTokenTransformer({
+      open: "{{",
+      close: "}}",
+      resolve: () => Promise.reject(undefined),
+    });
+    await expect(body.transform(bytes("{{a}}"), ctrl)).rejects.toBeUndefined();
+    await expect(body.transform(bytes("{{b}}"), ctrl)).rejects.toBeUndefined();
+  });
+
+  it("rejects a pre-aborted signal without calling the resolver", async () => {
+    const abort = new AbortController();
+    abort.abort("stop");
+    const body = createAsyncTokenTransformer({
+      open: "{{",
+      close: "}}",
+      signal: abort.signal,
+      resolve: () => {
+        throw new Error("unexpected resolver");
+      },
+    });
+    await expect(body.transform(bytes("{{a}}"), ctrl)).rejects.toBe("stop");
+  });
+});
+
+describe("first output", () => {
+  it("does not call an overridden catch while discarding a resolver promise", async () => {
+    const gate = deferred<Uint8Array | null>();
+    Object.defineProperty(gate.promise, "catch", {
+      value() {
+        throw new Error("unexpected catch");
+      },
+    });
+    const failure = new Error("enqueue failed");
+    const body = createAsyncTokenTransformer({
+      open: "{{",
+      close: "}}",
+      resolve: () => gate.promise,
+    });
+    const ctrl = {
+      enqueue() {
+        throw failure;
+      },
+    } as unknown as TransformStreamDefaultController<Uint8Array>;
+    await expect(body.transform(bytes("head{{x}}"), ctrl)).rejects.toBe(failure);
+    gate.reject(new Error("late rejection"));
+    await Promise.resolve();
+  });
+
+  for (const prefix of ["<head>", "{{fast}}", "{{promised}}"]) {
+    it(`delivers ${prefix} before a later lookup settles`, async () => {
+      const gate = deferred<Uint8Array | null>();
+      const stream = createAsyncTokenTransformStream({
+        open: "{{",
+        close: "}}",
+        resolve: (payload) => {
+          const name = decoder.decode(payload);
+          return name === "fast"
+            ? bytes("F")
+            : name === "promised"
+              ? Promise.resolve(bytes("F"))
+              : gate.promise;
+        },
+      });
+      const reader = stream.readable.getReader();
+      const writer = stream.writable.getWriter();
+      const first = reader.read();
+      const written = writer.write(bytes(`${prefix}{{slow}}tail`));
+      expect(decoder.decode((await first).value)).toBe(prefix === "<head>" ? prefix : "F");
+      gate.resolve(bytes("S"));
+      const rest: Uint8Array[] = [];
+      const drained = (async () => {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          rest.push(value);
+        }
+      })();
+      await written;
+      await writer.close();
+      await drained;
+      expect(decoder.decode(concat(rest))).toBe("Stail");
+      reader.releaseLock();
+      writer.releaseLock();
+    });
+  }
+
+  it("does not flush every later promise", async () => {
+    const parts: Uint8Array[] = [];
+    const ctrl = {
+      enqueue: (part: Uint8Array) => parts.push(part),
+    } as unknown as TransformStreamDefaultController<Uint8Array>;
+    const body = createAsyncTokenTransformer({
+      open: "{{",
+      close: "}}",
+      resolve: async () => bytes("X"),
+    });
+    await body.transform(bytes(`head${"{{x}}".repeat(100)}`), ctrl);
+    body.flush(ctrl);
+    expect(parts.length).toBe(2);
+    expect(decoder.decode(concat(parts))).toBe(`head${"X".repeat(100)}`);
+  });
+
+  it("handles an enqueue failure at the first await", async () => {
+    const gate = deferred<Uint8Array | null>();
+    const failure = new Error("enqueue failed");
+    const body = createAsyncTokenTransformer({
+      open: "{{",
+      close: "}}",
+      resolve: () => gate.promise,
+    });
+    const ctrl = {
+      enqueue: () => {
+        throw failure;
+      },
+    } as unknown as TransformStreamDefaultController<Uint8Array>;
+    await expect(body.transform(bytes("head{{x}}"), ctrl)).rejects.toBe(failure);
+    gate.reject(new Error("late rejection"));
+    await Promise.resolve();
   });
 });

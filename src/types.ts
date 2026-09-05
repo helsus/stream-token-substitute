@@ -11,7 +11,7 @@ export type TokenResolver = (payload: Uint8Array) => Uint8Array | null;
  *  `payload` is a fresh copy, so it stays valid across the await. */
 export type AsyncTokenResolver = (
   payload: Uint8Array,
-) => Uint8Array | null | Promise<Uint8Array | null>;
+) => Uint8Array | null | PromiseLike<Uint8Array | null>;
 
 /** Incremental validator, called once per byte committed to the payload.
  *  Return false to abort the token.
@@ -43,6 +43,8 @@ export interface TokenStats {
 export interface TokenTransformer {
   transform(chunk: Uint8Array, controller: TransformStreamDefaultController<Uint8Array>): void;
   flush(controller: TransformStreamDefaultController<Uint8Array>): void;
+  /** Release a single-use transformer without flushing. */
+  cancel?(reason?: unknown): void;
 }
 
 /** Async counterpart. `transform` settles once the chunk is fully consumed. */
@@ -52,6 +54,8 @@ export interface AsyncTokenTransformer {
     controller: TransformStreamDefaultController<Uint8Array>,
   ): Promise<void>;
   flush(controller: TransformStreamDefaultController<Uint8Array>): void;
+  /** Stop pending resolution and release scanner state. Does not cancel external I/O. */
+  cancel?(reason?: unknown): void;
 }
 
 /** Options common to the sync and async transformers. */
@@ -80,6 +84,8 @@ export interface TokenTransformOptions extends TokenTransformOptionsBase {
 
 export interface AsyncTokenTransformOptions extends TokenTransformOptionsBase {
   resolve: AsyncTokenResolver;
+  /** Cancels pending resolution, including in runtimes without Transformer.cancel. */
+  signal?: AbortSignal;
 }
 
 /** Normalized options, shared by reference and transformer. */

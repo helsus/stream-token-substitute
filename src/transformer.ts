@@ -1,4 +1,5 @@
 import { copyBytes, EMPTY, requeue } from "./bytes.ts";
+import { flowStream } from "./flow.ts";
 import { COMPLETE, DelimiterMatcher, REJECTED } from "./matcher.ts";
 import { Emitter } from "./output.ts";
 import {
@@ -37,6 +38,7 @@ type Controller = TransformStreamDefaultController<Uint8Array>;
  * Not part of the public API.
  */
 export class Substituter {
+  paused = false;
   private readonly openBytes: Uint8Array;
   private readonly closeBytes: Uint8Array;
   private readonly openFirst: number;
@@ -74,7 +76,7 @@ export class Substituter {
    *  without advancing, leaving every field exactly where `resume()` needs it. */
   protected suspended = false;
 
-  private readonly out: Emitter;
+  protected readonly out: Emitter;
 
   // Re-scan queue. A reused scratch: live bytes are queue[0..queueLen). The
   // payload it replays spans earlier chunks, so it cannot be re-read in place.
@@ -111,8 +113,13 @@ export class Substituter {
   }
 
   transform(chunk: Uint8Array, ctrl: Controller): void {
-    this.begin(chunk, ctrl);
-    this.pump();
+    try {
+      this.begin(chunk, ctrl);
+      this.pump();
+    } catch (error) {
+      this.reset();
+      throw error;
+    }
   }
 
   /** Accept a chunk and position the scanner at its first byte. */
@@ -128,13 +135,21 @@ export class Substituter {
   /** Scan the current chunk to its end, or until an async resolver suspends.
    *  Re-entrant: every exit point leaves the fields ready for the next call. */
   protected pump(): void {
+    this.paused = false;
     this.scan();
-    if (this.suspended) return;
+    if (this.suspended || this.paused) return;
     this.park();
     // Must precede dropping the chunk: buffered spans are views into it.
     this.out.flush();
+    this.out.ctrl = undefined;
     this.chunk = EMPTY;
     this.src = EMPTY;
+  }
+
+  resumeOutput(ctrl: Controller): void {
+    if (!this.paused) return;
+    this.out.ctrl = ctrl;
+    this.pump();
   }
 
   private enter(
@@ -186,11 +201,28 @@ export class Substituter {
                 matched = true;
                 break;
               }
-              this.i = idx + 1;
+              if (m > 1) {
+                // Preserve the prefix to avoid quadratic comparisons.
+                this.openM.k = m;
+                this.i = idx + m;
+                break;
+              }
+              // Skip frequent near misses with a short two-byte search.
+              let next = idx + 1;
+              const limit = Math.min(next + 64, end - 1);
+              const first = this.openFirst;
+              const second = open[1];
+              while (next < limit) {
+                const byte = src[next + 1];
+                if (byte === second && src[next] === first) break;
+                next += byte === first ? 1 : 2;
+              }
+              this.i = next;
             }
             if (this.i >= end) break;
             if (matched) {
               this.i++;
+              if (this.pauseOutput()) return;
               continue;
             }
           }
@@ -202,7 +234,22 @@ export class Substituter {
             copyBytes(this.payload, this.payloadLen, src, this.i, j);
             this.payloadLen += j - this.i;
             this.i = j;
-            continue;
+          }
+          if (this.i >= end) continue;
+          const close = this.closeBytes;
+          const len = close.length;
+          // Short, contained delimiters need no matcher state.
+          if (len <= 8 && this.i + len <= end && src[this.i] === this.closeFirst) {
+            let m = 1;
+            while (m < len && src[this.i + m] === close[m]) m++;
+            if (m === len) {
+              this.i += len - 1;
+              this.finishToken();
+              if (this.suspended) return;
+              this.i++;
+              if (this.pauseOutput()) return;
+              continue;
+            }
           }
         }
 
@@ -210,14 +257,21 @@ export class Substituter {
         if (this.suspended) return;
         if (this.restarted) {
           this.restarted = false;
+          if (this.pauseOutput()) return;
           continue;
         }
         this.i++;
+        if (this.pauseOutput()) return;
       }
 
       if (!this.inQueue) return;
       this.leaveQueue();
     }
+  }
+
+  private pauseOutput(): boolean {
+    this.paused = this.out.blocked;
+    return this.paused;
   }
 
   /** Park the chunk cursor and scan the queue in its place. */
@@ -252,15 +306,18 @@ export class Substituter {
 
   flush(ctrl: Controller): void {
     this.out.ctrl = ctrl;
-    if (this.state === IN_TOKEN) {
-      this.out.emit(this.openBytes);
-      if (this.payloadLen > 0) this.out.emit(this.payload.slice(0, this.payloadLen));
-      if (this.closeM.k > 0) this.out.emit(this.closeBytes.slice(0, this.closeM.k));
-    } else if (this.openM.k > 0) {
-      this.out.emit(this.openBytes.slice(0, this.openM.k));
+    try {
+      if (this.state === IN_TOKEN) {
+        this.out.emit(this.openBytes);
+        if (this.payloadLen > 0) this.out.emit(this.payload.slice(0, this.payloadLen));
+        if (this.closeM.k > 0) this.out.emit(this.closeBytes.slice(0, this.closeM.k));
+      } else if (this.openM.k > 0) {
+        this.out.emit(this.openBytes.slice(0, this.openM.k));
+      }
+      this.out.flush();
+    } finally {
+      this.reset();
     }
-    this.out.flush();
-    this.reset();
     if (this.stats !== undefined) {
       this.stats.bytesOut = this.out.bytesOut;
       (this.onDone as (s: TokenStats) => void)(this.stats);
@@ -412,7 +469,8 @@ export class Substituter {
       while (j < limit && src[j] !== this.closeFirst) j++;
       return j;
     }
-    const j = src.indexOf(this.closeFirst, from);
+    const bounded = limit < src.length ? src.subarray(0, limit) : src;
+    const j = bounded.indexOf(this.closeFirst, from);
     return j < 0 || j > limit ? limit : j;
   }
 
@@ -461,9 +519,8 @@ export class Substituter {
   private flushSpan(end: number): void {
     if (end > this.flushStart) {
       const src = this.src;
-      this.out.emit(
-        this.srcOwned ? src.slice(this.flushStart, end) : src.subarray(this.flushStart, end),
-      );
+      if (this.srcOwned) this.out.emit(src.slice(this.flushStart, end));
+      else this.out.emitRange(src, this.flushStart, end);
       this.flushStart = end;
     }
   }
@@ -476,8 +533,16 @@ export class Substituter {
     this.carry = 0;
   }
 
-  private reset(): void {
+  cancel(): void {
+    this.reset();
+  }
+
+  protected reset(): void {
+    this.paused = false;
     this.endToken();
+    this.suspended = false;
+    this.payload = EMPTY;
+    this.payloadViews.length = 0;
     this.chunk = EMPTY;
     this.src = EMPTY;
     this.srcEnd = 0;
@@ -496,16 +561,52 @@ export class Substituter {
  *  per stream. Touches no global other than `TextEncoder`, and only then if a
  *  delimiter is a string. */
 export function createTokenTransformer(options: TokenTransformOptions): TokenTransformer {
-  const s = new Substituter(options);
-  return {
-    transform: (chunk, ctrl) => s.transform(chunk, ctrl),
-    flush: (ctrl) => s.flush(ctrl),
+  let s: Substituter | undefined = new Substituter(options);
+  const body = {
+    get paused() {
+      return s?.paused ?? false;
+    },
+    resume: (ctrl: Controller) => {
+      try {
+        s?.resumeOutput(ctrl);
+      } catch (error) {
+        s?.cancel();
+        s = undefined;
+        throw error;
+      }
+    },
+    transform: (chunk: Uint8Array, ctrl: Controller) => {
+      if (s === undefined) throw new TypeError("transformer is no longer active");
+      try {
+        s.transform(chunk, ctrl);
+      } catch (error) {
+        s = undefined;
+        throw error;
+      }
+    },
+    flush: (ctrl: Controller) => {
+      const active = s;
+      s = undefined;
+      active?.flush(ctrl);
+    },
+    cancel: () => {
+      s?.cancel();
+      s = undefined;
+    },
   };
+  return body;
 }
 
-/** Single-use TransformStream. Construct one per stream. */
+/** Single-use native transform. */
 export function createTokenTransformStream(
   options: TokenTransformOptions,
 ): TransformStream<Uint8Array, Uint8Array> {
   return new TransformStream<Uint8Array, Uint8Array>(createTokenTransformer(options));
+}
+
+/** Single-use pair with intra-chunk backpressure. */
+export function createTokenStreamPair(
+  options: TokenTransformOptions,
+): ReadableWritablePair<Uint8Array, Uint8Array> {
+  return flowStream(createTokenTransformer(options));
 }

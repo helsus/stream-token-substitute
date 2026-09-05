@@ -138,3 +138,12 @@ export function prng(seed: number): () => number {
 export function hex(u8: Uint8Array): string {
   return Array.from(u8, (x) => x.toString(16).padStart(2, "0")).join(" ");
 }
+export function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
+  return { promise, resolve, reject };
+}

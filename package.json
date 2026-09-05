@@ -59,7 +59,7 @@
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:gc": "NODE_OPTIONS=--expose-gc vitest run test/streaming.test.ts",
+    "test:gc": "NODE_OPTIONS=--expose-gc vitest run test/streaming.test.ts test/memory.test.ts",
     "bench": "node bench/bench.ts",
     "bench:needles": "node bench/needles.ts",
     "bench:compare": "node bench/compare.ts",

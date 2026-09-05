@@ -90,20 +90,18 @@ export function resolveFrom(
  * Pipe a response body through a substitution and drop the headers that no
  * longer describe it: `Content-Length`, `ETag`, `Digest`, `Content-Digest`.
  *
- * Pass options to build a sync transformer, or a `TransformStream` you built
- * yourself, which is how an async resolver gets here without this module
- * depending on the async entrypoint.
+ * Accepts token options, native transforms, or stream pairs.
  *
  * A response with no body (204, HEAD) is returned untouched.
  */
 export function substituteResponse(
   response: Response,
-  substitution: TokenTransformOptions | TransformStream<Uint8Array, Uint8Array>,
+  substitution: TokenTransformOptions | ReadableWritablePair<Uint8Array, Uint8Array>,
 ): Response {
   if (response.body === null) return response;
 
   const transform =
-    substitution instanceof TransformStream
+    "readable" in substitution && "writable" in substitution
       ? substitution
       : createTokenTransformStream(substitution);
 
