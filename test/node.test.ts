@@ -24,6 +24,30 @@ async function collect(stream: NodeJS.ReadableStream): Promise<string> {
 const source = (parts: string[]) => Readable.from(parts.map((part) => Buffer.from(part)));
 
 describe("node adapter", () => {
+  it("preserves an async abort when resuming a backpressured write", async () => {
+    const abort = new AbortController();
+    const failure = new Error("request cancelled");
+    const stream = createAsyncTokenTransform(
+      {
+        open: "{{",
+        close: "}}",
+        signal: abort.signal,
+        resolve: async () => new Uint8Array(65536),
+      },
+      { highWaterMark: 1024 },
+    );
+    stream.on("error", () => {});
+    const available = new Promise<void>((done) => stream.once("readable", done));
+    const written = new Promise<Error | null | undefined>((done) => {
+      stream.write(bytes("{{a}}{{b}}"), done);
+    });
+    await available;
+    await new Promise((done) => setTimeout(done, 0));
+    abort.abort(failure);
+    await expect(collect(stream)).rejects.toBe(failure);
+    expect(await written).toBe(failure);
+  });
+
   it("pauses before resolving a needle behind a large prefix", async () => {
     let calls = 0;
     const stream = createNeedleTransform(

@@ -703,6 +703,33 @@ describe("memory", () => {
 describe("async cancellation", () => {
   const ctrl = { enqueue() {} } as unknown as TransformStreamDefaultController<Uint8Array>;
 
+  for (const preAborted of [false, true]) {
+    it(`rejects close when aborted ${preAborted ? "before creation" : "between writes"}`, async () => {
+      const abort = new AbortController();
+      const failure = new Error("request cancelled");
+      if (preAborted) abort.abort(failure);
+      const stream = createAsyncTokenTransformStream({
+        open: "{{",
+        close: "}}",
+        signal: abort.signal,
+        resolve: async () => null,
+      });
+      const reader = stream.readable.getReader();
+      const writer = stream.writable.getWriter();
+      if (!preAborted) {
+        const first = reader.read();
+        await writer.write(bytes("head{{unfinished"));
+        expect(decoder.decode((await first).value)).toBe("head");
+        abort.abort(failure);
+      }
+      const read = expect(reader.read()).rejects.toBe(failure);
+      await expect(writer.close()).rejects.toBe(failure);
+      await read;
+      reader.releaseLock();
+      writer.releaseLock();
+    });
+  }
+
   it("detaches pending work on readable cancellation", async () => {
     const gate = deferred<Uint8Array | null>();
     const started = deferred<void>();

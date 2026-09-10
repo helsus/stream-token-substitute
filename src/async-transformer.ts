@@ -217,13 +217,15 @@ export function createAsyncTokenTransformer(
     get paused() {
       return s?.paused ?? false;
     },
-    resume: (ctrl: Controller) => s?.transformAsync(undefined, ctrl),
+    resume: (ctrl: Controller) =>
+      s === undefined ? Promise.reject(terminalReason) : s.transformAsync(undefined, ctrl),
     transform: (chunk: Uint8Array, ctrl: Controller) =>
       s === undefined ? Promise.reject(terminalReason) : s.transformAsync(chunk, ctrl),
     flush: (ctrl: Controller) => {
+      if (s === undefined) throw terminalReason;
       const active = s;
       onClose(new TypeError("transformer is no longer active"));
-      active?.flush(ctrl);
+      active.flush(ctrl);
     },
     cancel: (reason?: unknown) => s?.cancel(reason),
   };

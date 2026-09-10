@@ -39,7 +39,7 @@ const BRACES = ".a{color:red}.b{margin:0}.c{padding:0}".repeat(9);
 /** ~2 MB of HTML, one heading per section. Big enough that the differences are
  *  not measurement noise. */
 function makeDocument(heading: (i: number) => string, filler = PROSE): Uint8Array {
-  const parts = [`<!doctype html><html><head><title>${heading(0)}</title></head><body>`];
+  const parts = [`<!doctype html><html><head><title>${heading(SECTIONS)}</title></head><body>`];
   for (let i = 0; i < SECTIONS; i++) {
     parts.push(`<section id="s${i}"><h2>${heading(i)}</h2><p>${filler}</p></section>`);
   }
@@ -142,7 +142,7 @@ async function ttfb(open: () => AsyncIterable<unknown>): Promise<number> {
 const templateDoc = makeDocument((i) => `{{h${i}}}`);
 
 const valueText = new Map<string, string>();
-for (let i = 0; i < SECTIONS; i++) {
+for (let i = 0; i <= SECTIONS; i++) {
   valueText.set(`h${i}`, `Heading number ${i}`);
 }
 
