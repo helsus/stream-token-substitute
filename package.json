@@ -76,7 +76,7 @@
     "@types/node": "^24.13.3",
     "@types/replacestream": "^4.0.4",
     "replacestream": "^4.0.3",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.10",
     "wrangler": "^4.119.0"
   },
