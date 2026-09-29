@@ -1,7 +1,6 @@
 export const EMPTY = new Uint8Array(0);
 
-/** Below this a byte loop beats subarray().set(): the view it allocates costs
- *  more than the bytes moved. */
+/** Below this a byte loop beats subarray().set(). */
 const COPY_LOOP_MAX = 128;
 
 /** Copy src[start..end) into dst at w. Returns the new write position. */
@@ -21,8 +20,7 @@ export function copyBytes(
   return w + len;
 }
 
-/** Make room for `head` bytes at the front of a pushback queue, relocating its
- *  unconsumed tail to `head`. In place when it fits. */
+/** Make room for `head` bytes at the front of a pushback queue. */
 export function requeue(
   queue: Uint8Array<ArrayBuffer>,
   head: number,
@@ -39,8 +37,7 @@ export function requeue(
   return queue;
 }
 
-/** Lazy: EdgeWorkers has no global TextEncoder, so constructing one at module
- *  scope would throw on import. */
+/** Lazy, since EdgeWorkers has no global TextEncoder. */
 let encoder: TextEncoder | undefined;
 
 /** Encode, or copy. Copied because these bytes are enqueued by reference. */

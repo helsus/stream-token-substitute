@@ -101,7 +101,7 @@ function makeInput(rnd: () => number, open: Uint8Array, close: Uint8Array): Uint
       for (let i = 0; i < rep; i++) frags.push(open.subarray(0, 1));
       frags.push(open);
     } else if (kind < 0.8) {
-      frags.push(bytes("héllo中文")); // multi-byte utf-8
+      frags.push(bytes("h\u00e9llo\u4e2d\u6587")); // multi-byte utf-8
     } else if (kind < 0.86) {
       frags.push(new Uint8Array([0xff, 0xfe, 0xc0, 0x80, 0xed, 0xa0])); // invalid utf-8
     } else {
@@ -288,7 +288,7 @@ const CORPUS = [
   "}}",
   "{{a}",
   "a{{b{{c}}d}}e",
-  "héllo {{n}} 中文",
+  "h\u00e9llo {{n}} \u4e2d\u6587",
 ].map(bytes);
 
 function allSplits(input: Uint8Array): Uint8Array[][] {
@@ -590,4 +590,73 @@ describe("async resolver thenables", () => {
     ).toBe("OK");
     expect(reads).toBe(1);
   });
+});
+
+describe("cap aborts without a validator", () => {
+  const CASES = [
+    { open: "{{", close: "}}" },
+    { open: "aa", close: "a" },
+    { open: "ab", close: "ba" },
+    { open: "aab", close: "baa" },
+    { open: "a", close: "b" },
+    { open: "aba", close: "c" },
+  ];
+
+  it("matches the reference with many opens, small caps and any chunking", async () => {
+    const rnd = prng(0x5eed);
+    for (const c of CASES) {
+      const open = bytes(c.open);
+      const close = bytes(c.close);
+      const frags = [open, open, close, open.subarray(0, 1), close.subarray(0, 1), bytes("x")];
+      for (let iter = 0; iter < 200; iter++) {
+        const parts: Uint8Array[] = [];
+        const count = 1 + Math.floor(rnd() * 24);
+        for (let f = 0; f < count; f++) parts.push(frags[Math.floor(rnd() * frags.length)]);
+        const input = concat(parts);
+        const options: TokenTransformOptions = {
+          open,
+          close,
+          maxPayloadBytes: Math.floor(rnd() * 7),
+          resolve: (p) => (rnd() < 0.2 ? null : concat([bytes("<"), p, bytes(">")])),
+        };
+        // The resolver is random, so pin its answers per payload.
+        const answers = new Map<string, Uint8Array | null>();
+        const pinned = options.resolve as (p: Uint8Array) => Uint8Array | null;
+        options.resolve = (p) => {
+          const key = hex(p);
+          if (!answers.has(key)) answers.set(key, pinned(p));
+          return answers.get(key) ?? null;
+        };
+        const expected = hex(substituteBytes(input, options));
+        const cuts: number[] = [];
+        for (let k = 1; k < input.length; k++) if (rnd() < 0.3) cuts.push(k);
+        const label = `${c.open}/${c.close} cap=${options.maxPayloadBytes} ${decoder.decode(input)}`;
+        expect(hex(await runStream(splitAt(input, cuts), options)), label).toBe(expected);
+        expect(hex(await runStream([input], options)), label).toBe(expected);
+      }
+    }
+  });
+
+  for (const chunk of [256 * 1024, 1000, 7]) {
+    it(`aborts 256 KiB of opens in linear time, chunk=${chunk}`, async () => {
+      const input = new Uint8Array(256 * 1024).fill(0x7b);
+      const chunks: Uint8Array[] = [];
+      for (let at = 0; at < input.length; at += chunk) chunks.push(input.subarray(at, at + chunk));
+      let aborted = 0;
+      const started = performance.now();
+      const out = await runStream(chunks, {
+        open: "{{",
+        close: "}}",
+        maxPayloadBytes: 16384,
+        resolve: () => null,
+        onDone: (stats) => {
+          aborted = stats.aborted;
+        },
+      });
+      expect(performance.now() - started).toBeLessThan(3000);
+      expect(out.length).toBe(input.length);
+      expect(out.every((byte) => byte === 0x7b)).toBe(true);
+      expect(aborted).toBeGreaterThan(1000);
+    });
+  }
 });

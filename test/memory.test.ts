@@ -1,11 +1,7 @@
 import { describe, expect, it } from "vitest";
-import {
-  createAsyncTokenStreamPair,
-  createAsyncTokenTransformer,
-} from "../src/async-transformer.ts";
-import { createNeedleStreamPair, createNeedleTransformer } from "../src/needles.ts";
+import { createLiteralStream, createLiteralTransformer } from "../src/literals.ts";
 import { createTokenTransform } from "../src/node.ts";
-import { createTokenStreamPair, createTokenTransformer } from "../src/transformer.ts";
+import { createTokenStream, createTokenTransformer } from "../src/transformer.ts";
 import { bytes, deferred } from "./helpers.ts";
 
 const gc = globalThis.gc;
@@ -25,7 +21,7 @@ describe.skipIf(!gc)("memory lifecycle", () => {
     const { stream, ref } = (() => {
       const signal = new AbortController().signal;
       return {
-        stream: createAsyncTokenStreamPair({
+        stream: createTokenStream({
           open: "{{",
           close: "}}",
           signal,
@@ -68,18 +64,18 @@ describe.skipIf(!gc)("memory lifecycle", () => {
     expect(stream.destroyed).toBe(true);
   });
 
-  for (const mode of ["sync", "async", "needles"] as const) {
+  for (const mode of ["sync", "async", "literals"] as const) {
     it(`releases paused ${mode} input on readable cancellation`, async () => {
       const options = { open: "{{", close: "}}", resolve: () => new Uint8Array(65536) };
       const stream =
         mode === "sync"
-          ? createTokenStreamPair(options)
+          ? createTokenStream(options)
           : mode === "async"
-            ? createAsyncTokenStreamPair({
+            ? createTokenStream({
                 ...options,
                 resolve: async () => options.resolve(),
               })
-            : createNeedleStreamPair({ needles: ["{{x}}"], resolve: options.resolve });
+            : createLiteralStream({ literals: ["{{x}}"], resolve: options.resolve });
       const ref = await (async () => {
         const input = new Uint8Array(4 * 1024 * 1024).fill(120);
         input.set(bytes("{{x}}".repeat(100)));
@@ -104,7 +100,7 @@ describe.skipIf(!gc)("memory lifecycle", () => {
     const { body, ref } = (() => {
       const signal = new AbortController().signal;
       return {
-        body: createAsyncTokenTransformer({ open: "{{", close: "}}", signal, resolve: () => null }),
+        body: createTokenTransformer({ open: "{{", close: "}}", signal, resolve: () => null }),
         ref: new WeakRef(signal),
       };
     })();
@@ -116,7 +112,7 @@ describe.skipIf(!gc)("memory lifecycle", () => {
   it("releases cancelled input while its resolver stays pending", async () => {
     const gate = deferred<Uint8Array | null>();
     const abort = new AbortController();
-    const body = createAsyncTokenTransformer({
+    const body = createTokenTransformer({
       open: "{{",
       close: "}}",
       signal: abort.signal,
@@ -136,7 +132,38 @@ describe.skipIf(!gc)("memory lifecycle", () => {
     expect(body.transform).toBeTypeOf("function");
   });
 
-  for (const mode of ["sync", "async", "needles"] as const) {
+  it("releases held lookahead output and cancels streams on abort", async () => {
+    const abort = new AbortController();
+    let cancelled = 0;
+    const gate = deferred<Uint8Array | null>();
+    const body = createTokenTransformer({
+      open: "{{",
+      close: "}}",
+      signal: abort.signal,
+      resolve: (payload) =>
+        payload[0] === 0x61
+          ? gate.promise
+          : new ReadableStream({
+              cancel() {
+                cancelled++;
+              },
+            }),
+    });
+    const ref = await (async () => {
+      const input = new Uint8Array(4 * 1024 * 1024).fill(120);
+      input.set(bytes("{{a}}{{b}}"));
+      const weak = new WeakRef(input.buffer);
+      const pending = body.transform(input, ctrl);
+      abort.abort("stop");
+      await expect(pending).rejects.toBe("stop");
+      return weak;
+    })();
+    await expectCollected(ref);
+    expect(cancelled).toBe(1);
+    gate.resolve(null);
+  });
+
+  for (const mode of ["sync", "async", "literals"] as const) {
     it(`releases ${mode} resolver configuration after flush`, async () => {
       const abort = new AbortController();
       const { body, ref } = (() => {
@@ -146,8 +173,8 @@ describe.skipIf(!gc)("memory lifecycle", () => {
           mode === "sync"
             ? createTokenTransformer(options)
             : mode === "async"
-              ? createAsyncTokenTransformer({ ...options, signal: abort.signal })
-              : createNeedleTransformer({ needles: ["{{x}}"], resolve: () => value });
+              ? createTokenTransformer({ ...options, signal: abort.signal })
+              : createLiteralTransformer({ literals: ["{{x}}"], resolve: () => value });
         return { body, ref: new WeakRef(value.buffer) };
       })();
       body.flush(ctrl);
@@ -157,7 +184,7 @@ describe.skipIf(!gc)("memory lifecycle", () => {
     });
   }
 
-  for (const mode of ["sync", "async", "needles", "validator", "enqueue"] as const) {
+  for (const mode of ["sync", "async", "literals", "validator", "enqueue"] as const) {
     it(`releases input after a ${mode} failure with the transformer still alive`, async () => {
       const failure = new Error("intentional failure");
       const fail = () => {
@@ -165,9 +192,9 @@ describe.skipIf(!gc)("memory lifecycle", () => {
       };
       const body =
         mode === "async"
-          ? createAsyncTokenTransformer({ open: "{{", close: "}}", resolve: async () => fail() })
-          : mode === "needles"
-            ? createNeedleTransformer({ needles: ["{{x}}"], resolve: fail })
+          ? createTokenTransformer({ open: "{{", close: "}}", resolve: async () => fail() })
+          : mode === "literals"
+            ? createLiteralTransformer({ literals: ["{{x}}"], resolve: fail })
             : createTokenTransformer({
                 open: "{{",
                 close: "}}",
@@ -236,12 +263,12 @@ describe.skipIf(!gc)("memory lifecycle", () => {
     });
   }
 
-  it("releases needle bridge scratch on flush", async () => {
+  it("releases literal bridge scratch on flush", async () => {
     let ref: WeakRef<object> | undefined;
-    const body = createNeedleTransformer({
-      needles: ["a".repeat(4096)],
-      resolve: (needle) => {
-        ref = new WeakRef(needle.buffer);
+    const body = createLiteralTransformer({
+      literals: ["a".repeat(4096)],
+      resolve: (literal) => {
+        ref = new WeakRef(literal.buffer);
         return null;
       },
     });

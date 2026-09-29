@@ -1,20 +1,21 @@
+import { createLiteralStream, type LiteralTransformOptions } from "../src/literals.ts";
 // Runtime-agnostic contract checks. Web Streams chunking and backpressure differ
 // per runtime, so this body is re-run under each one via a thin adapter.
 // No test framework, no assertion library: checks throw on mismatch.
-import {
-  createAsyncTokenStreamPair,
-  createAsyncTokenTransformer,
-  createAsyncTokenTransformStream,
-} from "../src/async-transformer.ts";
-import {
-  createNeedleStreamPair,
-  createNeedleTransformStream,
-  type NeedleTransformOptions,
-} from "../src/needles.ts";
-import { createTokenStreamPair, createTokenTransformStream } from "../src/transformer.ts";
+import { createTokenStream, createTokenTransformer } from "../src/transformer.ts";
 import type { TokenTransformOptions } from "../src/types.ts";
-import { bytes, concat, decoder, deferred, hex, runAsyncStream, runStream } from "./helpers.ts";
-import { substituteNeedles } from "./needle-reference.ts";
+import {
+  bytes,
+  concat,
+  decoder,
+  deferred,
+  hex,
+  nativeLiteralStream,
+  nativeTokenStream,
+  runAsyncStream,
+  runStream,
+} from "./helpers.ts";
+import { substituteLiterals } from "./literal-reference.ts";
 import { substituteBytes } from "./reference-impl.ts";
 
 const CORPUS = [
@@ -32,7 +33,7 @@ const CORPUS = [
   "{",
   "{{a}",
   "a{{b{{c}}d}}e",
-  "héllo {{n}} 中文",
+  "h\u00e9llo {{n}} \u4e2d\u6587",
 ].map(bytes);
 
 const options: TokenTransformOptions = {
@@ -53,20 +54,20 @@ const NEEDLE_CORPUS = [
   "ab",
   "abc",
   "abcd",
-  "héllo __A__ 中文",
+  "h\u00e9llo __A__ \u4e2d\u6587",
 ].map(bytes);
 
-// Nested and overlapping needles, so leftmost-longest is exercised too.
-const needleOptions: NeedleTransformOptions = {
-  needles: { __A__: "1", __B__: "22", ab: "X", abc: "YY" },
+// Nested and overlapping literals, so leftmost-longest is exercised too.
+const literalOptions: LiteralTransformOptions = {
+  literals: { __A__: "1", __B__: "22", ab: "X", abc: "YY" },
 };
 
-/** The needle transformer, driven the way runStream drives the token one. */
-async function runNeedleStream(
+/** The literal transformer, driven the way runStream drives the token one. */
+async function runLiteralStream(
   chunks: Uint8Array[],
-  options: NeedleTransformOptions,
+  options: LiteralTransformOptions,
 ): Promise<Uint8Array> {
-  const tx = createNeedleTransformStream(options);
+  const tx = nativeLiteralStream(options);
   const writer = tx.writable.getWriter();
   const reader = tx.readable.getReader();
   const parts: Uint8Array[] = [];
@@ -95,14 +96,14 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
     async run() {
       const options = { open: "{{", close: "}}", resolve: () => bytes("value") };
       const native = [
-        createTokenTransformStream(options),
-        createAsyncTokenTransformStream(options),
-        createNeedleTransformStream({ needles: { "{{x}}": "value" } }),
+        nativeTokenStream(options),
+        nativeTokenStream(options),
+        nativeLiteralStream({ literals: { "{{x}}": "value" } }),
       ];
       const pairs = [
-        createTokenStreamPair(options),
-        createAsyncTokenStreamPair(options),
-        createNeedleStreamPair({ needles: { "{{x}}": "value" } }),
+        createTokenStream(options),
+        createTokenStream(options),
+        createLiteralStream({ literals: { "{{x}}": "value" } }),
       ];
       for (const stream of native) {
         if (!(stream instanceof TransformStream)) throw new Error("lost native identity");
@@ -122,7 +123,7 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
     name: "abort signal releases a backpressured async stream",
     async run() {
       const abort = new AbortController();
-      const stream = createAsyncTokenStreamPair({
+      const stream = createTokenStream({
         open: "{{",
         close: "}}",
         signal: abort.signal,
@@ -143,7 +144,7 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
   {
     name: "pauses expansion within an input chunk and final flush",
     async run() {
-      for (const mode of ["sync", "async", "needles", "flush"]) {
+      for (const mode of ["sync", "async", "literals", "flush"]) {
         let calls = 0;
         const resolve = () => {
           calls++;
@@ -152,11 +153,15 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
         const options = { open: "{{", close: "}}", resolve };
         const stream =
           mode === "sync"
-            ? createTokenStreamPair(options)
+            ? createTokenStream(options)
             : mode === "async"
-              ? createAsyncTokenStreamPair({ ...options, resolve: async () => resolve() })
-              : createNeedleStreamPair({
-                  needles: mode === "flush" ? ["a", `${"a".repeat(1024)}b`] : ["{{x}}"],
+              ? createTokenStream({
+                  ...options,
+                  concurrency: 1,
+                  resolve: async () => resolve(),
+                })
+              : createLiteralStream({
+                  literals: mode === "flush" ? ["a", `${"a".repeat(1024)}b`] : ["{{x}}"],
                   resolve,
                 });
         const reader = stream.readable.getReader();
@@ -181,7 +186,7 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
     run: async () => {
       const gate = deferred<Uint8Array | null>();
       const parts: Uint8Array[] = [];
-      const body = createAsyncTokenTransformer({
+      const body = createTokenTransformer({
         open: "{{",
         close: "}}",
         resolve: () => gate.promise,
@@ -204,10 +209,11 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
       const started = deferred<void>();
       const abort = new AbortController();
       let calls = 0;
-      const body = createAsyncTokenTransformer({
+      const body = createTokenTransformer({
         open: "{{",
         close: "}}",
         signal: abort.signal,
+        concurrency: 1,
         resolve: () => {
           calls++;
           started.resolve();
@@ -215,11 +221,11 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
         },
       });
       const ctrl = { enqueue() {} } as TransformStreamDefaultController<Uint8Array>;
-      const written = body.transform(bytes("{{a}}{{b}}"), ctrl).then(
+      const written = Promise.resolve(body.transform(bytes("{{a}}{{b}}"), ctrl)).then(
         () => {
           throw new Error("write must reject");
         },
-        (reason) => {
+        (reason: unknown) => {
           if (reason !== "stop") throw reason;
         },
       );
@@ -301,30 +307,30 @@ export const CHECKS: Array<{ name: string; run: () => Promise<void> }> = [
     },
   },
   {
-    name: "needles match the reference for every 2-part split",
+    name: "literals match the reference for every 2-part split",
     run: async () => {
       for (const input of NEEDLE_CORPUS) {
-        const expected = substituteNeedles(input, needleOptions);
+        const expected = substituteLiterals(input, literalOptions);
         for (let cut = 0; cut <= input.length; cut++) {
           assertSame(
-            await runNeedleStream([input.subarray(0, cut), input.subarray(cut)], needleOptions),
+            await runLiteralStream([input.subarray(0, cut), input.subarray(cut)], literalOptions),
             expected,
-            `needles input=${decoder.decode(input)} cut=${cut}`,
+            `literals input=${decoder.decode(input)} cut=${cut}`,
           );
         }
       }
     },
   },
   {
-    name: "needles match the reference byte at a time",
+    name: "literals match the reference byte at a time",
     run: async () => {
       for (const input of NEEDLE_CORPUS) {
         const parts: Uint8Array[] = [];
         for (let i = 0; i < input.length; i++) parts.push(input.subarray(i, i + 1));
         assertSame(
-          await runNeedleStream(parts, needleOptions),
-          substituteNeedles(input, needleOptions),
-          `needles input=${decoder.decode(input)} per byte`,
+          await runLiteralStream(parts, literalOptions),
+          substituteLiterals(input, literalOptions),
+          `literals input=${decoder.decode(input)} per byte`,
         );
       }
     },

@@ -1,7 +1,7 @@
 {
   "name": "stream-token-substitute",
-  "version": "1.3.0",
-  "description": "Streaming, chunk-boundary-safe, zero-copy byte-level token substitution for Web Streams runtimes",
+  "version": "2.0.0",
+  "description": "Streaming, chunk-boundary-safe, zero-copy byte-level token and literal substitution for Web Streams runtimes",
   "type": "module",
   "sideEffects": false,
   "license": "MIT",
@@ -15,22 +15,6 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./needles": {
-      "types": "./dist/needles.d.ts",
-      "default": "./dist/needles.js"
-    },
-    "./async": {
-      "types": "./dist/async-transformer.d.ts",
-      "default": "./dist/async-transformer.js"
-    },
-    "./html": {
-      "types": "./dist/html-escape.d.ts",
-      "default": "./dist/html-escape.js"
-    },
-    "./helpers": {
-      "types": "./dist/helpers.d.ts",
-      "default": "./dist/helpers.js"
-    },
     "./node": {
       "types": "./dist/node.d.ts",
       "default": "./dist/node.js"
@@ -38,7 +22,7 @@
     "./package.json": "./package.json"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "keywords": [
     "aho-corasick",
@@ -46,12 +30,14 @@
     "cloudflare-workers",
     "deno",
     "edge",
+    "literal-replace",
     "replace",
     "search-replace",
     "stream",
     "streaming-replace",
     "substitution",
     "template",
+    "token-replace",
     "transformstream",
     "web-streams",
     "zero-copy"
@@ -68,7 +54,7 @@
     "test:workers": "vitest run -c vitest.workers.config.ts",
     "test:bun": "bun test runtime/bun.test.ts",
     "test:deno": "deno test runtime/deno.test.ts",
-    "test:fuzz": "vitest run test/differential.test.ts test/needles.test.ts"
+    "test:fuzz": "vitest run test/differential.test.ts test/literals.test.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
@@ -81,10 +67,6 @@
     "vitest": "^4.1.11",
     "wrangler": "^4.143.1"
   },
-  "overrides": {
-    "sharp": "^0.35.4",
-    "undici": "^7.30.0"
-  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/helsus/stream-token-substitute.git"
@@ -92,5 +74,9 @@
   "homepage": "https://github.com/helsus/stream-token-substitute#readme",
   "bugs": {
     "url": "https://github.com/helsus/stream-token-substitute/issues"
+  },
+  "overrides": {
+    "sharp": "^0.35.4",
+    "undici": "^7.30.0"
   }
 }

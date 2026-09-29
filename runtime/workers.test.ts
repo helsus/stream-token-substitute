@@ -1,8 +1,7 @@
 // Run: vitest run -c vitest.workers.config.ts
 import { expect, it } from "vitest";
-import { createNeedleTransformStream } from "../src/needles.ts";
-import { createTokenTransformStream } from "../src/transformer.ts";
 import { CHECKS } from "../test/cross-runtime.ts";
+import { nativeLiteralStream, nativeTokenStream } from "../test/helpers.ts";
 
 it("really is running inside workerd", () => {
   expect(navigator.userAgent).toBe("Cloudflare-Workers");
@@ -67,22 +66,19 @@ const tokenOptions = {
 it("batches output without changing its size", async () => {
   const input = makeDocument((i) => (i < 0 ? "{{t0}}" : `{{h${i}}}`), 500);
 
-  const buffered = await drain(input, createTokenTransformStream(tokenOptions));
-  const unbuffered = await drain(
-    input,
-    createTokenTransformStream({ ...tokenOptions, flushBytes: 0 }),
-  );
-  const needles = await drain(
+  const buffered = await drain(input, nativeTokenStream(tokenOptions));
+  const unbuffered = await drain(input, nativeTokenStream({ ...tokenOptions, flushBytes: 0 }));
+  const literals = await drain(
     makeDocument(() => "__ID__", 500),
-    createNeedleTransformStream({ needles: { __ID__: "0123456789abcdef" } }),
+    nativeLiteralStream({ literals: { __ID__: "0123456789abcdef" } }),
   );
 
   expect(buffered.bytes).toBe(unbuffered.bytes);
-  expect(needles.bytes).toBe(201475);
+  expect(literals.bytes).toBe(201475);
   expect(buffered.parts).toBeLessThan(unbuffered.parts);
 });
 
-for (const mode of ["tokens", "needles"] as const) {
+for (const mode of ["tokens", "literals"] as const) {
   it(`streams 256 MiB through workerd in ${mode} mode`, async () => {
     // Fresh chunks exercise buffer lifetimes.
     const chunk = encoder.encode(`${"x".repeat(CHUNK_SIZE - 8)}{{t0}}..`);
@@ -97,8 +93,8 @@ for (const mode of ["tokens", "needles"] as const) {
 
     const transform =
       mode === "tokens"
-        ? createTokenTransformStream(tokenOptions)
-        : createNeedleTransformStream({ needles: { "{{t0}}": "Benchmark document" } });
+        ? nativeTokenStream(tokenOptions)
+        : nativeLiteralStream({ literals: { "{{t0}}": "Benchmark document" } });
     const reader = body.pipeThrough(transform).getReader();
     let bytes = 0;
     for (;;) {

@@ -45,7 +45,7 @@ function shortEscape(byte: number): number {
   }
 }
 
-export function jsonEscapeBytes(src: Uint8Array): Uint8Array {
+export function escapeJson(src: Uint8Array): Uint8Array {
   if (!(src instanceof Uint8Array)) throw new TypeError("src must be a Uint8Array");
 
   // First pass: the first byte needing work, and the exact output length. Sizing
@@ -65,7 +65,7 @@ export function jsonEscapeBytes(src: Uint8Array): Uint8Array {
     }
     if (!needsEscape(byte)) continue;
     if (start < 0) start = i;
-    // \" \\ and the five short forms are 2 bytes; everything else is \u00XX.
+    // \" \\ and the five short forms are 2 bytes, everything else is \u00XX.
     total += byte === QUOTE || byte === BACKSLASH || shortEscape(byte) !== 0 ? 1 : 5;
   }
   if (start === -1) return src;

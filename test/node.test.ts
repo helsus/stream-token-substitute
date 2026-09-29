@@ -1,11 +1,7 @@
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { describe, expect, it } from "vitest";
-import {
-  createAsyncTokenTransform,
-  createNeedleTransform,
-  createTokenTransform,
-} from "../src/node.ts";
+import { createLiteralTransform, createTokenTransform } from "../src/node.ts";
 import { bytes, decoder, deferred } from "./helpers.ts";
 
 const values = new Map([
@@ -27,11 +23,12 @@ describe("node adapter", () => {
   it("preserves an async abort when resuming a backpressured write", async () => {
     const abort = new AbortController();
     const failure = new Error("request cancelled");
-    const stream = createAsyncTokenTransform(
+    const stream = createTokenTransform(
       {
         open: "{{",
         close: "}}",
         signal: abort.signal,
+        concurrency: 1,
         resolve: async () => new Uint8Array(65536),
       },
       { highWaterMark: 1024 },
@@ -48,11 +45,11 @@ describe("node adapter", () => {
     expect(await written).toBe(failure);
   });
 
-  it("pauses before resolving a needle behind a large prefix", async () => {
+  it("pauses before resolving a literal behind a large prefix", async () => {
     let calls = 0;
-    const stream = createNeedleTransform(
+    const stream = createLiteralTransform(
       {
-        needles: ["{{x}}"],
+        literals: ["{{x}}"],
         resolve: () => {
           calls++;
           return bytes("X");
@@ -68,7 +65,7 @@ describe("node adapter", () => {
     expect(calls).toBe(1);
   });
 
-  for (const mode of ["sync", "async", "needles", "needle flush"] as const) {
+  for (const mode of ["sync", "async", "literals", "literal flush"] as const) {
     it(`pauses ${mode} expansion at the readable high-water mark`, async () => {
       let calls = 0;
       const resolve = () => {
@@ -81,29 +78,29 @@ describe("node adapter", () => {
         mode === "sync"
           ? createTokenTransform(options, streamOptions)
           : mode === "async"
-            ? createAsyncTokenTransform(
-                { ...options, resolve: async () => resolve() },
+            ? createTokenTransform(
+                { ...options, concurrency: 1, resolve: async () => resolve() },
                 streamOptions,
               )
-            : createNeedleTransform(
-                { needles: mode === "needle flush" ? ["a", "aab"] : ["{{x}}"], resolve },
+            : createLiteralTransform(
+                { literals: mode === "literal flush" ? ["a", "aab"] : ["{{x}}"], resolve },
                 streamOptions,
               );
       const available = new Promise<void>((done) => stream.once("readable", done));
-      stream.end(bytes(mode === "needle flush" ? "aa" : "{{x}}".repeat(100)));
+      stream.end(bytes(mode === "literal flush" ? "aa" : "{{x}}".repeat(100)));
       await available;
       await new Promise((done) => setTimeout(done, 0));
       expect(calls).toBe(1);
       expect(stream.readableLength).toBe(65536);
       let total = 0;
       for await (const part of stream) total += part.length;
-      expect(calls).toBe(mode === "needle flush" ? 2 : 100);
+      expect(calls).toBe(mode === "literal flush" ? 2 : 100);
       expect(total).toBe(calls * 65536);
     });
   }
 
   for (const reason of [undefined, null, false, 0, "", "failure"]) {
-    for (const mode of ["sync", "async", "needles", "flush"] as const) {
+    for (const mode of ["sync", "async", "literals", "flush"] as const) {
       it(`propagates ${mode} failures with reason ${String(reason)}`, async () => {
         const fail = () => {
           throw reason;
@@ -111,9 +108,9 @@ describe("node adapter", () => {
         const options = { open: "{{", close: "}}", resolve: fail };
         const transform =
           mode === "async"
-            ? createAsyncTokenTransform({ ...options, resolve: () => Promise.reject(reason) })
-            : mode === "needles"
-              ? createNeedleTransform({ needles: ["{{x}}"], resolve: fail })
+            ? createTokenTransform({ ...options, resolve: () => Promise.reject(reason) })
+            : mode === "literals"
+              ? createLiteralTransform({ literals: ["{{x}}"], resolve: fail })
               : createTokenTransform(
                   mode === "flush" ? { ...options, resolve: () => null, onDone: fail } : options,
                 );
@@ -164,10 +161,10 @@ describe("node adapter", () => {
     expect(out).toBe("a {{missing}} b");
   });
 
-  it("substitutes needles", async () => {
+  it("substitutes literals", async () => {
     const out = await collect(
       source(["a __ON", "E__ b __TWO__"]).pipe(
-        createNeedleTransform({ needles: { __ONE__: "1", __TWO__: "2" } }),
+        createLiteralTransform({ literals: { __ONE__: "1", __TWO__: "2" } }),
       ),
     );
     expect(out).toBe("a 1 b 2");
@@ -176,7 +173,7 @@ describe("node adapter", () => {
   it("awaits an async resolver", async () => {
     const out = await collect(
       source(["hello {{name}}"]).pipe(
-        createAsyncTokenTransform({
+        createTokenTransform({
           open: "{{",
           close: "}}",
           resolve: async (payload) => {
@@ -214,7 +211,7 @@ describe("node adapter", () => {
         },
       });
       const stream = source.pipe(
-        createNeedleTransform({ needles: { __M__: "v" } }, { highWaterMark }),
+        createLiteralTransform({ literals: { __M__: "v" } }, { highWaterMark }),
       );
       const iterator = stream[Symbol.asyncIterator]();
       await iterator.next();
@@ -238,7 +235,7 @@ describe("node adapter", () => {
       },
     });
     const stream = source.pipe(
-      createNeedleTransform({ needles: { __M__: "v" } }, { signal: controller.signal }),
+      createLiteralTransform({ literals: { __M__: "v" } }, { signal: controller.signal }),
     );
 
     const drained = (async () => {
@@ -278,9 +275,10 @@ describe("node adapter", () => {
     const gate = deferred<Uint8Array | null>();
     const started = deferred<void>();
     let calls = 0;
-    const stream = createAsyncTokenTransform({
+    const stream = createTokenTransform({
       open: "{{",
       close: "}}",
+      concurrency: 1,
       resolve: () => {
         calls++;
         started.resolve();

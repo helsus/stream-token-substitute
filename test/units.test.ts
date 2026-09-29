@@ -1,3 +1,4 @@
+import { nativeTokenStream } from "./helpers.ts";
 // The token scanner's unit surface: placement, delimiters, options, and the
 // KMP matcher underneath it.
 
@@ -9,7 +10,7 @@ import {
   DelimiterMatcher,
   REJECTED,
 } from "../src/matcher.ts";
-import { createTokenTransformStream } from "../src/transformer.ts";
+
 import type { TokenTransformOptions } from "../src/types.ts";
 import { bytes, concat, decoder, hex, runStream, runStreamParts } from "./helpers.ts";
 import { substituteBytes } from "./reference-impl.ts";
@@ -148,24 +149,20 @@ describe("flush conditions", () => {
 
 describe("error contract", () => {
   it("throws synchronously on bad options", () => {
-    expect(() => createTokenTransformStream({ open: "", resolve: upper })).toThrow(TypeError);
-    expect(() => createTokenTransformStream({ open: "{{", close: "", resolve: upper })).toThrow(
-      TypeError,
+    expect(() => nativeTokenStream({ open: "", resolve: upper })).toThrow(TypeError);
+    expect(() => nativeTokenStream({ open: "{{", close: "", resolve: upper })).toThrow(TypeError);
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation
+    expect(() => nativeTokenStream({ open: "{{" } as any)).toThrow(TypeError);
+    expect(() => nativeTokenStream({ open: "{{", resolve: upper, maxPayloadBytes: -1 })).toThrow(
+      RangeError,
     );
     // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation
-    expect(() => createTokenTransformStream({ open: "{{" } as any)).toThrow(TypeError);
-    expect(() =>
-      createTokenTransformStream({ open: "{{", resolve: upper, maxPayloadBytes: -1 }),
-    ).toThrow(RangeError);
+    expect(() => nativeTokenStream(null as any)).toThrow(TypeError);
     // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation
-    expect(() => createTokenTransformStream(null as any)).toThrow(TypeError);
-    // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation
-    expect(() => createTokenTransformStream({ open: 42 as any, resolve: upper })).toThrow(
-      TypeError,
-    );
+    expect(() => nativeTokenStream({ open: 42 as any, resolve: upper })).toThrow(TypeError);
     expect(() =>
       // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation
-      createTokenTransformStream({ open: "{{", resolve: upper, validate: 1 as any }),
+      nativeTokenStream({ open: "{{", resolve: upper, validate: 1 as any }),
     ).toThrow(TypeError);
   });
 
@@ -175,7 +172,7 @@ describe("error contract", () => {
     // the caller's bytes are overwritten.
     const open = Buffer.from("{{");
     const close = Buffer.from("}}");
-    const tx = createTokenTransformStream({ open, close, resolve: upper });
+    const tx = nativeTokenStream({ open, close, resolve: upper });
     open.fill(0);
     close.fill(0);
     const writer = tx.writable.getWriter();
@@ -191,7 +188,7 @@ describe("error contract", () => {
   });
 
   it("errors the stream on a non-Uint8Array chunk", async () => {
-    const tx = createTokenTransformStream(opts());
+    const tx = nativeTokenStream(opts());
     const writer = tx.writable.getWriter();
     const reader = tx.readable.getReader();
     // The readable has no queue by default, so start the read before writing.
@@ -202,7 +199,7 @@ describe("error contract", () => {
   });
 
   it("errors both sides when the resolver throws", async () => {
-    const tx = createTokenTransformStream(
+    const tx = nativeTokenStream(
       opts({
         resolve: () => {
           throw new Error("boom");
@@ -217,7 +214,7 @@ describe("error contract", () => {
   });
 
   it("errors both sides when the validator throws", async () => {
-    const tx = createTokenTransformStream(
+    const tx = nativeTokenStream(
       opts({
         validate: () => {
           throw new Error("bang");
@@ -311,7 +308,7 @@ describe("delimiter shapes", () => {
 
   it("handles symmetric multi-byte delimiters", async () => {
     const override: TokenTransformOptions = { open: new Uint8Array([0xc2, 0xa7]), resolve: upper };
-    expect(decoder.decode(await runStream([bytes("a§x§b")], override))).toBe("aXb");
+    expect(decoder.decode(await runStream([bytes("a\u00a7x\u00a7b")], override))).toBe("aXb");
   });
 
   it("handles self-overlapping delimiters across chunks", async () => {
@@ -390,7 +387,7 @@ describe("flushBytes", () => {
 
   it("rejects invalid values", () => {
     for (const bad of [-1, 1.5, Number.NaN, "16" as unknown as number]) {
-      expect(() => createTokenTransformStream(opts({ flushBytes: bad }))).toThrow(RangeError);
+      expect(() => nativeTokenStream(opts({ flushBytes: bad }))).toThrow(RangeError);
     }
   });
 });

@@ -1,142 +1,134 @@
-import { AhoCorasick } from "./aho-corasick.ts";
+import { AhoCorasick, DEFAULT_MAX_MEMORY_BYTES } from "./aho-corasick.ts";
 import { copyBytes, EMPTY, encodeText } from "./bytes.ts";
-import { flowStream } from "./flow.ts";
-import { buildFailureTable } from "./matcher.ts";
+import { checkSignal, type FlowBody, flowStream } from "./flow.ts";
 import { Emitter } from "./output.ts";
 
-export { DEFAULT_MAX_TABLE_BYTES } from "./aho-corasick.ts";
+export { DEFAULT_MAX_MEMORY_BYTES } from "./aho-corasick.ts";
 
 type Controller = TransformStreamDefaultController<Uint8Array>;
 
-/** Resolve a matched needle to substitution bytes. `index` is its position in
- *  the compiled set. Bytes are enqueued by reference, so do not mutate them
- *  after. null emits the needle verbatim. `needle` is scratch: a view valid
- *  only during the call, so copy it to keep it. */
-export type NeedleResolver = (needle: Uint8Array, index: number) => Uint8Array | null;
+/** Replacement for a matched literal. `literal` is a view valid only during the
+ *  call, returning it is safe. Bytes are enqueued by reference. null emits it verbatim. */
+export type LiteralResolver = (literal: Uint8Array, index: number) => Uint8Array | string | null;
+
+type ByteResolver = (literal: Uint8Array, index: number) => Uint8Array | null;
 
 /** Counts for one stream, delivered once from `flush`. */
-export interface NeedleStats {
-  /** Matches whose resolver returned bytes (including empty). */
+export interface LiteralStats {
   substituted: number;
-  /** Matches whose resolver returned null, emitted verbatim. */
   rejected: number;
   bytesIn: number;
   bytesOut: number;
 }
 
-/** Literals to replace. A record or Map supplies the replacements; an array
- *  supplies only the needles and requires `resolve`. Strings are UTF-8 encoded
- *  once. Needles must be non-empty. */
-export type NeedleSource =
+/** A record or Map supplies replacements. An array needs `resolve`. */
+export type LiteralSource =
   | Record<string, string | Uint8Array>
   | Map<string | Uint8Array, string | Uint8Array>
   | readonly (string | Uint8Array)[];
 
-export interface CompileNeedleOptions {
-  /** Ceiling on the automaton's transition table, in bytes. Defaults to
-   *  `DEFAULT_MAX_TABLE_BYTES`. Raise it for a large set on a runtime with room
-   *  for it, lower it to fail earlier on a constrained one. */
-  maxTableBytes?: number;
+export interface CompileLiteralOptions {
+  /** Estimated compile memory ceiling. Default `DEFAULT_MAX_MEMORY_BYTES`. */
+  maxMemoryBytes?: number;
 }
 
-export interface NeedleTransformOptions extends CompileNeedleOptions {
-  /** A `NeedleSource`, or the result of `compileNeedles`. `maxTableBytes` is
-   *  ignored for an already-compiled set. */
-  needles: NeedleSource | CompiledNeedles;
-  /** Overrides the table, and is required when `needles` is an array. */
-  resolve?: NeedleResolver;
-  /** Output accumulator high-water mark. See `TokenTransformOptions`. Default 16384. */
+export interface LiteralTransformOptions extends CompileLiteralOptions {
+  /** Ignores `maxMemoryBytes` when already compiled. */
+  literals: LiteralSource | CompiledLiterals;
+  /** Required when `literals` is an array. */
+  resolve?: LiteralResolver;
+  /** Output merge threshold in bytes. Default 16384. */
   flushBytes?: number;
-  onDone?: (stats: NeedleStats) => void;
+  /** Stops the stream with the abort reason. */
+  signal?: AbortSignal;
+  onDone?: (stats: LiteralStats) => void;
 }
 
-export interface NeedleTransformer {
+export interface LiteralTransformer {
   transform(chunk: Uint8Array, controller: Controller): void;
   flush(controller: Controller): void;
   cancel?(reason?: unknown): void;
 }
 
-interface CompiledNeedleOptions {
-  set: NeedleSet;
-  resolve: NeedleResolver;
+interface CompiledLiteralOptions {
+  set: LiteralSet;
+  resolve: ByteResolver;
   flushBytes: number;
-  onDone: ((stats: NeedleStats) => void) | undefined;
+  onDone: ((stats: LiteralStats) => void) | undefined;
 }
 
 /** The automaton plus the bytes it matches. Opaque and immutable. */
-class NeedleSet {
-  readonly needles: Uint8Array[];
+class LiteralSet {
+  readonly literals: Uint8Array[];
   readonly values: Uint8Array[] | undefined;
   readonly ac: AhoCorasick;
 
-  constructor(needles: Uint8Array[], values: Uint8Array[] | undefined, maxTableBytes?: number) {
-    this.needles = needles;
+  constructor(
+    literals: Uint8Array[],
+    values: Uint8Array[] | undefined,
+    maxMemoryBytes: number,
+    reserved: number,
+  ) {
+    this.literals = literals;
     this.values = values;
-    this.ac = new AhoCorasick(needles, maxTableBytes);
+    this.ac = new AhoCorasick(literals, maxMemoryBytes, reserved);
   }
 }
 
-export type CompiledNeedles = NeedleSet;
+export type CompiledLiterals = LiteralSet;
 
 /** Rolling match index for overlap-heavy streams. */
-class IndexedNeedles {
-  private readonly needles: readonly Uint8Array[];
+class IndexedLiterals {
+  private readonly literals: readonly Uint8Array[];
   private readonly ac: AhoCorasick;
-  private readonly resolve: NeedleResolver;
+  private readonly resolve: ByteResolver;
   private readonly out: Emitter;
   private readonly ring: Uint8Array;
+  /** Per start position in the ring: longest literal index + 1, 0 for none. */
   private readonly matches: Uint32Array;
-  private readonly states: Uint32Array;
-  private readonly failures: (Uint8Array | Uint32Array)[];
   private read = 0;
   private at = 0;
   private plain = 0;
   private node = 0;
 
   constructor(
-    needles: readonly Uint8Array[],
+    literals: readonly Uint8Array[],
     ac: AhoCorasick,
-    resolve: NeedleResolver,
+    resolve: ByteResolver,
     out: Emitter,
   ) {
-    this.needles = needles;
+    this.literals = literals;
     this.ac = ac;
     this.resolve = resolve;
     this.out = out;
     this.ring = new Uint8Array(ac.maxLength + 1);
     this.matches = new Uint32Array(this.ring.length);
-    this.states = new Uint32Array(needles.length);
-    this.failures = needles.map(buildFailureTable);
   }
 
   scan(src: Uint8Array, from: number, end: number): number {
+    const { delta, width, classOf, own, dict } = this.ac;
+    const size = this.ring.length;
     this.settle(false);
     for (let i = from; i < end; i++) {
       if (this.read - this.plain === this.ring.length) this.flushPlain();
       if (this.out.blocked) return i;
       const byte = src[i];
-      const slot = this.read % this.ring.length;
+      const slot = this.read % size;
       this.ring[slot] = byte;
       this.matches[slot] = 0;
-      for (let p = 0; p < this.needles.length; p++) {
-        const needle = this.needles[p];
-        const fail = this.failures[p];
-        let k = this.states[p];
-        while (k > 0 && needle[k] !== byte) k = fail[k - 1];
-        if (needle[k] === byte) k++;
-        if (k === needle.length) {
-          const start = this.read + 1 - k;
-          if (start >= this.at) {
-            const pos = start % this.ring.length;
-            const prev = this.matches[pos];
-            if (prev === 0 || this.needles[prev - 1].length < k) this.matches[pos] = p + 1;
-          }
-          k = fail[k - 1];
-        }
-        this.states[p] = k;
-      }
-      this.node = this.ac.delta[this.node * this.ac.width + this.ac.classOf[byte]];
+      const node = delta[this.node * width + classOf[byte]];
+      this.node = node;
       this.read++;
+      // Every literal ending here, longest (earliest start) first.
+      for (let s = own[node] >= 0 ? node : dict[node]; s !== 0; s = dict[s]) {
+        const p = own[s];
+        const length = this.literals[p].length;
+        const start = this.read - length;
+        if (start < this.at) continue;
+        const pos = start % size;
+        const prev = this.matches[pos];
+        if (prev === 0 || this.literals[prev - 1].length < length) this.matches[pos] = p + 1;
+      }
       this.settle(false);
       if (this.out.blocked) return i + 1;
     }
@@ -162,7 +154,8 @@ class IndexedNeedles {
       }
       this.flushPlain();
       if (this.out.blocked) return;
-      const length = this.needles[match - 1].length;
+      const length = this.literals[match - 1].length;
+      // A fresh copy, so returning it is safe.
       const payload = this.copy(this.at, length);
       const value = this.resolve(payload, match - 1);
       this.at += length;
@@ -189,23 +182,31 @@ class IndexedNeedles {
   }
 }
 
-/** Build the automaton once, outside the request path. A transformer is
- *  constructed per stream and the trie is identical every time, so for a fixed
- *  set do this at module scope and pass the result as `needles`.
- *
- *  Matches bytes, not characters: no Unicode normalization, so NFC and NFD
- *  spellings of the same text do not match each other. Duplicates keep the
- *  first entry. Throws on an empty set, an empty needle, or a set whose
- *  transition table would be too large. */
-export function compileNeedles(
-  source: NeedleSource,
-  options?: CompileNeedleOptions,
-): CompiledNeedles {
-  const needles: Uint8Array[] = [];
+/** Compile once at module scope and reuse. Byte matching, duplicates keep the first. */
+export function compileLiterals(
+  source: LiteralSource,
+  options?: CompileLiteralOptions,
+): CompiledLiterals {
+  const max = options?.maxMemoryBytes ?? DEFAULT_MAX_MEMORY_BYTES;
+  if (!Number.isSafeInteger(max) || max <= 0) {
+    throw new RangeError("maxMemoryBytes must be a positive safe integer");
+  }
+  const literals: Uint8Array[] = [];
   let values: Uint8Array[] | undefined;
+  let reserved = 0;
+  const add = (list: Uint8Array[], bytes: Uint8Array) => {
+    reserved += bytes.length;
+    if (reserved > max) {
+      throw new RangeError(
+        `literal set too large: literals and values take ${reserved} bytes, ` +
+          `over the ${max} byte maxMemoryBytes limit`,
+      );
+    }
+    list.push(bytes);
+  };
 
   if (Array.isArray(source)) {
-    for (const needle of source) needles.push(encodeText(needle, "needle"));
+    for (const literal of source) add(literals, encodeText(literal, "literal"));
   } else {
     const entries =
       source instanceof Map
@@ -215,39 +216,49 @@ export function compileNeedles(
             string | Uint8Array,
           ][]);
     values = [];
-    for (const [needle, value] of entries) {
-      needles.push(encodeText(needle, "needle"));
-      values.push(encodeText(value, "replacement"));
+    for (const [literal, value] of entries) {
+      add(literals, encodeText(literal, "literal"));
+      add(values, encodeText(value, "replacement"));
     }
   }
 
-  if (needles.length === 0) throw new TypeError("needles must not be empty");
-  for (const needle of needles) {
-    if (needle.length === 0) throw new TypeError("needles must be non-empty");
+  if (literals.length === 0) throw new TypeError("literals must not be empty");
+  for (const literal of literals) {
+    if (literal.length === 0) throw new TypeError("literals must be non-empty");
   }
-  const max = options?.maxTableBytes;
-  if (max !== undefined && (!Number.isSafeInteger(max) || max <= 0)) {
-    throw new RangeError("maxTableBytes must be a positive safe integer");
-  }
-  return new NeedleSet(needles, values, max);
+  return new LiteralSet(literals, values, max, reserved);
 }
 
-export function compileNeedleOptions(options: NeedleTransformOptions): CompiledNeedleOptions {
+function kindOf(value: unknown): string {
+  if (typeof value !== "object") return typeof value;
+  if (Array.isArray(value)) return "array";
+  return (value as object).constructor?.name ?? "object";
+}
+
+export function compileLiteralOptions(options: LiteralTransformOptions): CompiledLiteralOptions {
   if (options == null || typeof options !== "object") {
     throw new TypeError("options must be an object");
   }
-  const source = options.needles;
-  const set = source instanceof NeedleSet ? source : compileNeedles(source, options);
+  const source = options.literals;
+  const set = source instanceof LiteralSet ? source : compileLiterals(source, options);
 
-  let resolve = options.resolve;
-  if (resolve === undefined) {
+  const user = options.resolve;
+  let resolve: ByteResolver;
+  if (user === undefined) {
     if (set.values === undefined) {
-      throw new TypeError("resolve is required when needles is an array");
+      throw new TypeError("resolve is required when literals is an array");
     }
     const table = set.values;
-    resolve = (_needle, index) => table[index];
-  } else if (typeof resolve !== "function") {
+    resolve = (_literal, index) => table[index];
+  } else if (typeof user !== "function") {
     throw new TypeError("resolve must be a function");
+  } else {
+    resolve = (literal, index) => {
+      const value: unknown = user(literal, index);
+      if (value === null || value instanceof Uint8Array) return value;
+      if (typeof value === "string") return encodeText(value, "replacement");
+      throw new TypeError(`resolve must return Uint8Array, string, or null; got ${kindOf(value)}`);
+    };
   }
 
   const flushBytes = options.flushBytes ?? 16384;
@@ -261,31 +272,19 @@ export function compileNeedleOptions(options: NeedleTransformOptions): CompiledN
   return { set, resolve, flushBytes, onDone: options.onDone };
 }
 
-/**
- * Literal multi-pattern substitution, leftmost-longest. Substituted bytes are
- * never re-scanned, so a replacement containing a needle cannot cascade.
- *
- * Only bytes that could begin a needle are held; the rest leave as views into
- * the chunk they arrived in. The held window is bounded by the longest needle,
- * so carried state is independent of body size.
- *
- * `scan` is the whole scanner: a window surviving a chunk boundary is bridged
- * with the next chunk's leading bytes and scanned as one buffer, and a
- * substitution re-scans in place rather than through a pushback queue. Not part
- * of the public API.
- */
-export class NeedleSubstituter {
+/** Leftmost-longest literal scanner. Held bytes are bounded by the longest literal. */
+export class LiteralSubstituter {
   done = false;
   paused = false;
   private chunk: Uint8Array = EMPTY;
   private bridgeTake = 0;
   private flushing = false;
   private flushTail = false;
-  private index: IndexedNeedles | undefined;
+  private index: IndexedLiterals | undefined;
   private replayed = 0;
   private pendingCommit = false;
-  private readonly resolve: NeedleResolver;
-  private readonly onDone: ((stats: NeedleStats) => void) | undefined;
+  private readonly resolve: ByteResolver;
+  private readonly onDone: ((stats: LiteralStats) => void) | undefined;
   private readonly out: Emitter;
   // Automaton tables, cached to skip the double indirection per byte.
   private readonly delta: Uint16Array | Int32Array;
@@ -297,20 +296,18 @@ export class NeedleSubstituter {
   private readonly firstByteMask: Uint8Array;
   private readonly soleFirstByte: number;
   private readonly maxLength: number;
-  private readonly needles: readonly Uint8Array[];
+  private readonly literals: readonly Uint8Array[];
   private readonly ac: AhoCorasick;
 
   private bytesIn = 0;
   private substituted = 0;
   private rejected = 0;
 
-  /** The tail that may still match, grown only when a chunk strands a prefix.
-   *  At most two windows: held bytes followed by the next chunk's bridge. */
+  /** Tail that may still match: held bytes, then the next chunk bridge. */
   private hold: Uint8Array<ArrayBuffer> = EMPTY;
   private holdLen = 0;
 
-  // The buffer being scanned. `srcOwned` marks one the scanner reuses, whose
-  // spans must be copied to be emitted; a chunk goes out by reference.
+  // `srcOwned`: src is a reused scratch, so its spans are copied out.
   private src: Uint8Array<ArrayBufferLike> = EMPTY;
   private srcEnd = 0;
   private srcOwned = false;
@@ -323,9 +320,9 @@ export class NeedleSubstituter {
   private candLen = 0;
   private candIdx = -1;
 
-  constructor(options: NeedleTransformOptions) {
-    const compiled = compileNeedleOptions(options);
-    this.needles = compiled.set.needles;
+  constructor(options: LiteralTransformOptions) {
+    const compiled = compileLiteralOptions(options);
+    this.literals = compiled.set.literals;
     this.ac = compiled.set.ac;
     this.resolve = compiled.resolve;
     this.onDone = compiled.onDone;
@@ -408,24 +405,22 @@ export class NeedleSubstituter {
       return;
     }
     if (this.holdLen > 0 && !this.flushTail) {
-      // Nothing follows, so the window is decided. Copied, so its spans can go
-      // out by reference; entered past the end, since it is already scanned.
+      // Nothing follows, so the window is decided. Scanned already, so enter past its end.
       const tail = this.hold.slice(0, this.holdLen);
       this.holdLen = 0;
       this.enter(tail, tail.length, false, tail.length, 0);
       this.flushTail = true;
       if (tail.length > 256) {
-        this.indexedScan(0);
+        const index = this.indexedScan(0);
         if (this.paused) return;
-        this.paused = !(this.index as unknown as IndexedNeedles).finish();
+        this.paused = !index.finish();
         return;
       }
     }
     if (this.flushTail) {
       this.scan();
       if (this.paused) return;
-      // Looped, not an `if`: re-scanning the bytes behind a decided match can
-      // leave a fresh candidate with nothing after it to force the decision.
+      // A re-scan behind a decided match can leave a fresh candidate.
       while (this.candStart >= 0) {
         this.commit();
         if (this.out.blocked) {
@@ -467,8 +462,7 @@ export class NeedleSubstituter {
         this.park();
         return;
       }
-      // `take` was maxLength, so any surviving window is at most that long and
-      // lies wholly in the bridged bytes: rebase it instead of copying it.
+      // The surviving window lies wholly in the bridged bytes, so rebase it.
       const held = this.srcEnd - take;
       const ws = this.srcEnd - this.windowLen();
       this.emitSpan(ws);
@@ -495,8 +489,7 @@ export class NeedleSubstituter {
     this.flushStart = flushStart;
   }
 
-  /** Run the automaton over src[i..srcEnd). State lives in fields, so it
-   *  resumes across buffers and chunks. */
+  /** Run the automaton over src[i..srcEnd). */
   private scan(): void {
     if (this.pendingCommit) {
       this.commit();
@@ -529,7 +522,7 @@ export class NeedleSubstituter {
 
     while (i < end) {
       if (node === 0) {
-        // Only a needle's first byte leaves the root.
+        // Only a literal's first byte leaves the root.
         if (sole >= 0) {
           // Bounded by `end`, not by the buffer: `hold` outlives its span.
           const at = src.indexOf(sole, i);
@@ -557,8 +550,7 @@ export class NeedleSubstituter {
           candIdx = outIdx[node];
         }
       }
-      // A maximum-length match cannot extend or lose to an earlier match.
-      // Otherwise wait until no live prefix reaches back to its start.
+      // A maximum-length match cannot extend or lose to an earlier one.
       if (candStart >= 0 && (candLen === this.maxLength || i - depth[node] > candStart)) {
         this.i = i;
         this.node = node;
@@ -592,24 +584,25 @@ export class NeedleSubstituter {
   }
 
   /** Switch once, retaining the index across chunks. */
-  private indexedScan(from: number): void {
-    this.index = new IndexedNeedles(
-      this.needles,
+  private indexedScan(from: number): IndexedLiterals {
+    const index = new IndexedLiterals(
+      this.literals,
       this.ac,
-      (payload, index) => {
-        const value = this.resolve(payload, index);
+      (payload, at) => {
+        const value = this.resolve(payload, at);
         if (value === null) this.rejected++;
         else this.substituted++;
         return value;
       },
       this.out,
     );
+    this.index = index;
     this.i = from;
     this.scan();
+    return index;
   }
 
-  /** Emit the content before the pending match and then the match's
-   *  replacement, leaving the cursor just past it with a reset automaton. */
+  /** Emit up to the pending match, then its replacement. */
   private commit(): void {
     const start = this.candStart;
     const end = start + this.candLen;
@@ -626,7 +619,10 @@ export class NeedleSubstituter {
       this.emitRange(start, end);
       this.rejected++;
     } else {
-      if (value.length > 0) this.out.emit(value);
+      // A view of a buffer the scanner reuses must be copied to outlive it.
+      if (value.length > 0) {
+        this.out.emit(this.srcOwned && value.buffer === this.src.buffer ? value.slice() : value);
+      }
       this.substituted++;
     }
     this.i = end;
@@ -636,8 +632,7 @@ export class NeedleSubstituter {
     this.candLen = 0;
   }
 
-  /** Bytes at the end of the buffer that must survive it: the live prefix, and
-   *  a pending match if it starts before the prefix does. */
+  /** Start of the bytes that must outlive the buffer. */
   private windowLen(): number {
     const d = this.depth[this.node];
     if (this.candStart < 0) return d;
@@ -645,8 +640,7 @@ export class NeedleSubstituter {
     return span > d ? span : d;
   }
 
-  /** End of buffer: emit everything already decided and copy the live window
-   *  into `hold`, where the next chunk picks it up. */
+  /** End of buffer: emit what is decided, keep the live window in `hold`. */
   private park(): void {
     const end = this.srcEnd;
     const ws = end - this.windowLen();
@@ -708,59 +702,64 @@ export class NeedleSubstituter {
   }
 }
 
-/** Single-use transformer body, for runtimes where `TransformStream` is not a
- *  global. Construct one per stream. */
-export function createNeedleTransformer(options: NeedleTransformOptions): NeedleTransformer {
-  let s: NeedleSubstituter | undefined = new NeedleSubstituter(options);
-  const body = {
+/** Body for `new TransformStream(...)`. Single use. */
+export function createLiteralTransformer(options: LiteralTransformOptions): LiteralTransformer {
+  let signal = options?.signal;
+  checkSignal(signal);
+  let s: LiteralSubstituter | undefined = new LiteralSubstituter(options);
+  let failure: { reason: unknown } | undefined;
+  const stop = (reason?: unknown) => {
+    s?.cancel();
+    s = undefined;
+    failure ??= { reason };
+    signal?.removeEventListener("abort", onAbort);
+    signal = undefined;
+  };
+  const onAbort = () => stop(signal?.reason);
+  const inactive = () => failure?.reason ?? new TypeError("transformer is no longer active");
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const body: LiteralTransformer & FlowBody = {
     get paused() {
       return s?.paused ?? false;
     },
     resume: (ctrl: Controller) => {
+      if (s === undefined) throw inactive();
       try {
-        s?.resumeOutput(ctrl);
-        if (s?.done) s = undefined;
+        s.resumeOutput(ctrl);
+        if (s.done) stop();
       } catch (error) {
-        s?.cancel();
-        s = undefined;
+        stop(error);
         throw error;
       }
     },
     transform: (chunk: Uint8Array, ctrl: Controller) => {
-      if (s === undefined) throw new TypeError("transformer is no longer active");
+      if (s === undefined) throw inactive();
       try {
         s.transform(chunk, ctrl);
       } catch (error) {
-        s = undefined;
+        stop(error);
         throw error;
       }
     },
     flush: (ctrl: Controller) => {
-      const active = s;
+      if (s === undefined) throw inactive();
       try {
-        active?.flush(ctrl);
-      } finally {
-        if (!active?.paused) s = undefined;
+        s.flush(ctrl);
+      } catch (error) {
+        stop(error);
+        throw error;
       }
+      if (!s.paused) stop();
     },
-    cancel: () => {
-      s?.cancel();
-      s = undefined;
-    },
+    cancel: stop,
   };
   return body;
 }
 
-/** Single-use native transform. */
-export function createNeedleTransformStream(
-  options: NeedleTransformOptions,
-): TransformStream<Uint8Array, Uint8Array> {
-  return new TransformStream<Uint8Array, Uint8Array>(createNeedleTransformer(options));
-}
-
-/** Single-use pair with intra-chunk backpressure. */
-export function createNeedleStreamPair(
-  options: NeedleTransformOptions,
+/** Backpressured pair for `pipeThrough`. Single use. */
+export function createLiteralStream(
+  options: LiteralTransformOptions,
 ): ReadableWritablePair<Uint8Array, Uint8Array> {
-  return flowStream(createNeedleTransformer(options));
+  return flowStream(createLiteralTransformer(options), options?.signal);
 }

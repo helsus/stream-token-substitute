@@ -42,7 +42,7 @@ it("imports and substitutes with no stream or encoding globals", async () => {
   const result = await withoutGlobals(async () => {
     // Fresh evaluation under the stripped globals: a module-scope
     // `new TextEncoder()` anywhere in the package would throw right here.
-    const { createTokenTransformer, createTokenTransformStream } = await import("../src/index.ts");
+    const { createTokenStream, createTokenTransformer } = await import("../src/index.ts");
 
     const encoder = new encoding.TextEncoder();
     const decoder = new encoding.TextDecoder();
@@ -71,9 +71,9 @@ it("imports and substitutes with no stream or encoding globals", async () => {
     }
 
     const thrown: string[] = [];
-    // The wrapper is the one path that needs the global TransformStream.
+    // The backpressured pair is the one path that needs global streams.
     try {
-      createTokenTransformStream({ open: encoder.encode("{{"), resolve: () => null });
+      createTokenStream({ open: encoder.encode("{{"), resolve: () => null });
     } catch (error) {
       thrown.push((error as Error).constructor.name);
     }
@@ -118,22 +118,22 @@ it("accepts Uint8Array delimiters without ever constructing a TextEncoder", asyn
   expect(output).toEqual(new Uint8Array([0x21]));
 });
 
-it("imports and substitutes needles with no stream or encoding globals", async () => {
+it("imports and substitutes literals with no stream or encoding globals", async () => {
   const result = await withoutGlobals(async () => {
     // Same contract as the token entrypoint: a module-scope `new TextEncoder()`
-    // in needles.ts or aho-corasick.ts would throw on this import.
-    const { createNeedleTransformer } = await import("../src/needles.ts");
+    // in literals.ts or aho-corasick.ts would throw on this import.
+    const { createLiteralTransformer } = await import("../src/literals.ts");
 
     const thrown: string[] = [];
     try {
-      // A string needle needs a global TextEncoder, which EdgeWorkers lacks.
-      createNeedleTransformer({ needles: { __A__: "1" } });
+      // A string literal needs a global TextEncoder, which EdgeWorkers lacks.
+      createLiteralTransformer({ literals: { __A__: "1" } });
     } catch (error) {
       thrown.push((error as Error).message);
     }
 
-    const transform = createNeedleTransformer({
-      needles: new Map([[new Uint8Array([0x61, 0x62]), new Uint8Array([0x21])]]),
+    const transform = createLiteralTransformer({
+      literals: new Map([[new Uint8Array([0x61, 0x62]), new Uint8Array([0x21])]]),
     });
     const stream = new StreamsTransformStream<Uint8Array, Uint8Array>(transform);
     const writer = stream.writable.getWriter();
@@ -143,7 +143,7 @@ it("imports and substitutes needles with no stream or encoding globals", async (
   });
 
   expect(result.thrown).toEqual([
-    "needle must be a Uint8Array in runtimes without a global TextEncoder",
+    "literal must be a Uint8Array in runtimes without a global TextEncoder",
   ]);
   expect(result.value).toEqual(new Uint8Array([0x78, 0x21, 0x79]));
 });

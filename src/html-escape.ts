@@ -77,12 +77,12 @@ function escapeWith(src: Uint8Array, escapes: EscapeTable, name: string): Uint8A
 }
 
 /** Escape `& < > " '` for an HTML text node or a quoted attribute value. */
-export function htmlEscapeBytes(src: Uint8Array): Uint8Array {
+export function escapeHtml(src: Uint8Array): Uint8Array {
   return escapeWith(src, TEXT_TABLE, "src");
 }
 
 /** Escape for an attribute value that may be unquoted: everything
- *  `htmlEscapeBytes` handles, plus whitespace and `/ = \``. */
-export function attrEscapeBytes(src: Uint8Array): Uint8Array {
+ *  `escapeHtml` handles, plus whitespace and `/ = \``. */
+export function escapeAttr(src: Uint8Array): Uint8Array {
   return escapeWith(src, ATTR_TABLE, "src");
 }

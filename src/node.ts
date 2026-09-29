@@ -1,57 +1,58 @@
 import { type Duplex, Transform, type TransformCallback } from "node:stream";
-import { createAsyncTokenTransformer } from "./async-transformer.ts";
-import { BLOCKED, BUFFER_LIMIT, type FlowBody } from "./flow.ts";
-import { createNeedleTransformer, type NeedleTransformOptions } from "./needles.ts";
+import { BLOCKED, BUFFER_LIMIT, type FlowBody, type OutputController } from "./flow.ts";
+import { createLiteralTransformer, type LiteralTransformOptions } from "./literals.ts";
 import { createTokenTransformer } from "./transformer.ts";
-import type {
-  AsyncTokenTransformer,
-  AsyncTokenTransformOptions,
-  TokenTransformer,
-  TokenTransformOptions,
-} from "./types.ts";
-
-type Controller = TransformStreamDefaultController<Uint8Array>;
-type Body = FlowBody;
+import type { TokenTransformOptions } from "./types.ts";
 
 function streamError(reason: unknown): Error {
   return reason instanceof Error ? reason : new Error("substitution failed", { cause: reason });
 }
 
-/**
- * The Node stream options that mean something here.
- *
- * The rest are fixed: the scanner takes `Uint8Array` chunks and emits them, so
- * object mode, encodings and string decoding would only break that contract.
- */
+/** The Node stream options that apply. Chunks are always bytes. */
 export interface NodeStreamOptions {
-  /** Bytes buffered on each side before backpressure. The Node default is
-   *  version-dependent. Raising it trades memory for fewer stalls on a fast source. */
+  /** Bytes buffered on each side before backpressure. */
   highWaterMark?: number;
-  /** Destroys the stream when aborted, failing whatever is piping it. */
+  /** Destroys the stream when aborted. */
   signal?: AbortSignal;
 }
 
-/**
- * The transformer bodies driven by a Node `Transform` rather than by
- * `Duplex.fromWeb`.
- *
- * Not a style preference: `Duplex.fromWeb` registers one `done` as both the
- * fulfil and the reject handler of `writer.ready`, and its `writev` `done`
- * starts with `error.filter(...)`. A rejected `ready` therefore hands a lone
- * Error to a function expecting an array, and the TypeError escapes the promise
- * as an uncaught exception. `ready` rejects whenever the readable side is
- * abandoned mid-body, which for a server is just a client hanging up.
- *
- * The bodies only ever call `enqueue`, so the controller is one method.
- */
+class NodeController implements OutputController {
+  blocked = false;
+  readonly #stream: Transform;
+  readonly [BUFFER_LIMIT]: number;
+
+  constructor(stream: Transform) {
+    this.#stream = stream;
+    this[BUFFER_LIMIT] = Math.max(1, stream.readableHighWaterMark);
+  }
+
+  get desiredSize(): number {
+    return this.#stream.readableHighWaterMark - this.#stream.readableLength;
+  }
+
+  enqueue(part: Uint8Array): void {
+    this.blocked = !this.#stream.push(part);
+  }
+
+  error(reason?: unknown): void {
+    this.#stream.destroy(streamError(reason));
+  }
+
+  terminate(): void {
+    this.#stream.push(null);
+  }
+
+  [BLOCKED] = (): boolean => this.blocked;
+}
+
+// Not Duplex.fromWeb: a rejected writer.ready there escapes as an uncaught TypeError.
 class SubstituteTransform extends Transform {
-  #body: Body | undefined;
-  readonly #controller: Controller;
-  #blocked = false;
+  #body: FlowBody | undefined;
+  readonly #controller: NodeController;
   #continue: (() => void) | undefined;
   #callback: TransformCallback | undefined;
 
-  constructor(body: TokenTransformer | AsyncTokenTransformer, stream: NodeStreamOptions = {}) {
+  constructor(body: FlowBody, stream: NodeStreamOptions = {}) {
     super({
       highWaterMark: stream.highWaterMark,
       signal: stream.signal,
@@ -59,29 +60,27 @@ class SubstituteTransform extends Transform {
       decodeStrings: true,
     });
     this.#body = body;
-    this.#controller = {
-      enqueue: (part: Uint8Array): void => {
-        this.#blocked = !this.push(part);
-      },
-      [BLOCKED]: () => this.#blocked,
-      [BUFFER_LIMIT]: Math.max(1, this.readableHighWaterMark),
-    } as unknown as Controller;
+    this.#controller = new NodeController(this);
   }
 
   override _transform(chunk: Uint8Array, _encoding: string, callback: TransformCallback): void {
     this.#callback = callback;
-    this.#run(() => (this.#body as Body).transform(chunk, this.#controller));
+    this.#run((body) => body.transform(chunk, this.#controller));
   }
 
-  #run(action: () => void | Promise<void>): void {
+  #run(action: (body: FlowBody) => void | Promise<void>): void {
+    const body = this.#body;
+    if (body === undefined) {
+      this.#finish(new Error("stream destroyed"));
+      return;
+    }
     let pending: void | Promise<void>;
     try {
-      pending = action();
+      pending = action(body);
     } catch (error) {
       this.#finish(streamError(error));
       return;
     }
-    // The sync body returns undefined and has already pushed everything.
     if (pending === undefined) this.#settle();
     else
       pending.then(
@@ -98,14 +97,14 @@ class SubstituteTransform extends Transform {
 
   #settle(): void {
     if (this.#body?.paused) {
-      const resume = () => this.#run(() => this.#body?.resume?.(this.#controller));
-      if (this.#blocked) this.#continue = resume;
+      const resume = () => this.#run((body) => body.resume?.(this.#controller));
+      if (this.#controller.blocked) this.#continue = resume;
       else resume();
     } else this.#finish();
   }
 
   override _read(size: number): void {
-    this.#blocked = false;
+    this.#controller.blocked = false;
     const resume = this.#continue;
     this.#continue = undefined;
     if (resume !== undefined) resume();
@@ -114,7 +113,7 @@ class SubstituteTransform extends Transform {
 
   override _flush(callback: TransformCallback): void {
     this.#callback = callback;
-    this.#run(() => (this.#body as Body).flush(this.#controller));
+    this.#run((body) => body.flush(this.#controller));
   }
 
   override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
@@ -127,10 +126,7 @@ class SubstituteTransform extends Transform {
   }
 }
 
-/** For `pipeline()` and `.pipe()`. A `Buffer` is a `Uint8Array`, so nothing is
- *  decoded on the way in; parts come out as `Buffer` views over the same bytes.
- *  Buffer ownership still applies: a source that recycles one pooled buffer must
- *  copy first. `fs`, `http` and `zlib` allocate per read. */
+/** Token substitution as a Node `Transform`. Output parts are views, not copies. */
 export function createTokenTransform(
   options: TokenTransformOptions,
   stream?: NodeStreamOptions,
@@ -138,18 +134,10 @@ export function createTokenTransform(
   return new SubstituteTransform(createTokenTransformer(options), stream);
 }
 
-/** Same, with an awaitable resolver. */
-export function createAsyncTokenTransform(
-  options: AsyncTokenTransformOptions,
+/** Literal substitution as a Node `Transform`. */
+export function createLiteralTransform(
+  options: LiteralTransformOptions,
   stream?: NodeStreamOptions,
 ): Duplex {
-  return new SubstituteTransform(createAsyncTokenTransformer(options), stream);
-}
-
-/** Literal multi-pattern substitution as a Node stream. */
-export function createNeedleTransform(
-  options: NeedleTransformOptions,
-  stream?: NodeStreamOptions,
-): Duplex {
-  return new SubstituteTransform(createNeedleTransformer(options), stream);
+  return new SubstituteTransform(createLiteralTransformer(options), stream);
 }

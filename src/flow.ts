@@ -1,3 +1,9 @@
+export function checkSignal(signal: AbortSignal | undefined): void {
+  if (signal !== undefined && !(signal instanceof AbortSignal)) {
+    throw new TypeError("signal must be an AbortSignal");
+  }
+}
+
 export const BLOCKED = Symbol("output backpressure");
 export const BUFFER_LIMIT = Symbol("output buffer limit");
 
@@ -8,7 +14,7 @@ export type OutputController = TransformStreamDefaultController<Uint8Array> & {
 
 export interface FlowBody {
   transform(chunk: Uint8Array, ctrl: OutputController): void | Promise<void>;
-  flush(ctrl: OutputController): void;
+  flush(ctrl: OutputController): void | Promise<void>;
   cancel?(reason?: unknown): void;
   readonly paused?: boolean;
   resume?(ctrl: OutputController): void | Promise<void>;
@@ -103,7 +109,7 @@ export function flowStream(
     },
     async close() {
       try {
-        body.flush(ctrl);
+        await body.flush(ctrl);
         await drain();
         if (stopped) throw reason;
         output.close();

@@ -1,21 +1,13 @@
+import { nativeLiteralStream, nativeTokenStream } from "./helpers.ts";
 // Stream behaviour rather than substitution semantics: awaitable resolvers,
 // counts, backpressure, zero-copy output and carried-state bounds.
 
 import { describe, expect, it } from "vitest";
-import {
-  createAsyncTokenStreamPair,
-  createAsyncTokenTransformer,
-  createAsyncTokenTransformStream,
-} from "../src/async-transformer.ts";
 import { substituteResponse } from "../src/helpers.ts";
-import { createTokenStreamPair as exportedTokenStreamPair } from "../src/index.ts";
-import { createNeedleStreamPair, createNeedleTransformStream } from "../src/needles.ts";
-import { createTokenStreamPair, createTokenTransformStream } from "../src/transformer.ts";
-import type {
-  AsyncTokenTransformOptions,
-  TokenStats,
-  TokenTransformOptions,
-} from "../src/types.ts";
+import { createTokenStream as exportedTokenStreamPair } from "../src/index.ts";
+import { createLiteralStream } from "../src/literals.ts";
+import { createTokenStream, createTokenTransformer } from "../src/transformer.ts";
+import type { TokenStats, TokenTransformOptions } from "../src/types.ts";
 import {
   bytes,
   concat,
@@ -38,9 +30,7 @@ const values = new Map([
   ["city", bytes("London")],
 ]);
 
-const asyncOptions = (
-  extra: Partial<AsyncTokenTransformOptions> = {},
-): AsyncTokenTransformOptions => ({
+const asyncOptions = (extra: Partial<TokenTransformOptions> = {}): TokenTransformOptions => ({
   open,
   close,
   resolve: async (payload) => values.get(decoder.decode(payload)) ?? null,
@@ -118,6 +108,7 @@ describe("async transformer", () => {
     await runAsyncStream([bytes("{{one}}{{two}}{{three}}")], {
       open,
       close,
+      concurrency: 1,
       resolve: async (payload) => {
         const name = decoder.decode(payload);
         // Deliberately inverted delays: ordering must come from the scanner
@@ -148,7 +139,7 @@ describe("async transformer", () => {
   });
 
   it("re-scans an aborted token whose inner token resolves asynchronously", async () => {
-    const options: AsyncTokenTransformOptions = {
+    const options: TokenTransformOptions = {
       open,
       close,
       validate: (_p, next) => next >= 0x61 && next <= 0x7a,
@@ -159,7 +150,7 @@ describe("async transformer", () => {
   });
 
   it("rejects a non-Uint8Array chunk", async () => {
-    const tx = createAsyncTokenTransformStream(asyncOptions());
+    const tx = nativeTokenStream(asyncOptions());
     const writer = tx.writable.getWriter();
     const read = tx.readable
       .getReader()
@@ -360,18 +351,18 @@ async function assertBounded(tx: TransformStream<Uint8Array, Uint8Array>): Promi
 
 describe("Web factory compatibility", () => {
   it("exports the sync pair factory from the main entrypoint", () => {
-    expect(exportedTokenStreamPair).toBe(createTokenStreamPair);
+    expect(exportedTokenStreamPair).toBe(createTokenStream);
   });
 
-  for (const mode of ["sync", "async", "needles"] as const) {
+  for (const mode of ["sync", "async", "literals"] as const) {
     it(`retains native ${mode} identity and transferability`, async () => {
       const options = { open: "{{", close: "}}", resolve: () => bytes("v") };
       const stream =
         mode === "sync"
-          ? createTokenTransformStream(options)
+          ? nativeTokenStream(options)
           : mode === "async"
-            ? createAsyncTokenTransformStream(options)
-            : createNeedleTransformStream({ needles: { "{{x}}": "v" } });
+            ? nativeTokenStream(options)
+            : nativeLiteralStream({ literals: { "{{x}}": "v" } });
       expect(stream).toBeInstanceOf(TransformStream);
       const getter = Object.getOwnPropertyDescriptor(TransformStream.prototype, "readable")?.get;
       if (!getter) throw new Error("missing native getter");
@@ -386,10 +377,10 @@ describe("Web factory compatibility", () => {
       const options = { open: "{{", close: "}}", resolve: () => bytes("v") };
       const pair =
         mode === "sync"
-          ? createTokenStreamPair(options)
+          ? createTokenStream(options)
           : mode === "async"
-            ? createAsyncTokenStreamPair(options)
-            : createNeedleStreamPair({ needles: { "{{x}}": "v" } });
+            ? createTokenStream(options)
+            : createLiteralStream({ literals: { "{{x}}": "v" } });
       expect(pair).not.toBeInstanceOf(TransformStream);
       expect(await substituteResponse(new Response("{{x}}"), pair).text()).toBe("v");
     });
@@ -397,7 +388,7 @@ describe("Web factory compatibility", () => {
 });
 
 describe("backpressure", () => {
-  for (const mode of ["sync", "async", "needles"] as const) {
+  for (const mode of ["sync", "async", "literals"] as const) {
     it(`bounds ${mode} buffering with a large flushBytes setting`, async () => {
       let calls = 0;
       const resolve = () => {
@@ -407,11 +398,11 @@ describe("backpressure", () => {
       const options = { open: "{{", close: "}}", resolve, flushBytes: Number.MAX_SAFE_INTEGER };
       const tx =
         mode === "sync"
-          ? createTokenStreamPair(options)
+          ? createTokenStream(options)
           : mode === "async"
-            ? createAsyncTokenStreamPair({ ...options, resolve: async () => resolve() })
-            : createNeedleStreamPair({
-                needles: ["{{x}}"],
+            ? createTokenStream({ ...options, resolve: async () => resolve() })
+            : createLiteralStream({
+                literals: ["{{x}}"],
                 resolve,
                 flushBytes: options.flushBytes,
               });
@@ -434,7 +425,7 @@ describe("backpressure", () => {
     });
   }
 
-  for (const mode of ["sync", "async", "needles", "needle flush"] as const) {
+  for (const mode of ["sync", "async", "literals", "literal flush"] as const) {
     it(`pauses ${mode} expansion within one input chunk`, async () => {
       let calls = 0;
       let completed = 0;
@@ -445,11 +436,15 @@ describe("backpressure", () => {
       const options = { open: "{{", close: "}}", resolve, onDone: () => completed++ };
       const tx =
         mode === "sync"
-          ? createTokenStreamPair(options)
+          ? createTokenStream(options)
           : mode === "async"
-            ? createAsyncTokenStreamPair({ ...options, resolve: async () => resolve() })
-            : createNeedleStreamPair({
-                needles: mode === "needle flush" ? ["a", `${"a".repeat(2048)}b`] : ["{{x}}"],
+            ? createTokenStream({
+                ...options,
+                concurrency: 1,
+                resolve: async () => resolve(),
+              })
+            : createLiteralStream({
+                literals: mode === "literal flush" ? ["a", `${"a".repeat(2048)}b`] : ["{{x}}"],
                 resolve,
                 onDone: () => completed++,
               });
@@ -457,9 +452,9 @@ describe("backpressure", () => {
       const writer = tx.writable.getWriter();
       const first = reader.read();
       let settled = false;
-      const count = mode === "needle flush" ? 2000 : 100;
+      const count = mode === "literal flush" ? 2000 : 100;
       const written = writer
-        .write(bytes((mode === "needle flush" ? "a" : "{{x}}").repeat(count)))
+        .write(bytes((mode === "literal flush" ? "a" : "{{x}}").repeat(count)))
         .then(() => writer.close())
         .then(() => {
           settled = true;
@@ -483,7 +478,7 @@ describe("backpressure", () => {
   }
 
   it("aborts a paused write without waiting for a reader", async () => {
-    const tx = createTokenStreamPair({
+    const tx = createTokenStream({
       open: "{{",
       close: "}}",
       resolve: () => new Uint8Array(65536),
@@ -502,14 +497,12 @@ describe("backpressure", () => {
   });
 
   it("holds the writer while the reader is stalled", async () => {
-    await assertBounded(
-      createTokenTransformStream({ open: "{{", close: "}}", resolve: () => bytes("v") }),
-    );
+    await assertBounded(nativeTokenStream({ open: "{{", close: "}}", resolve: () => bytes("v") }));
   });
 
   it("holds the writer through an awaitable resolver", async () => {
     await assertBounded(
-      createAsyncTokenTransformStream({
+      nativeTokenStream({
         open: "{{",
         close: "}}",
         resolve: async () => bytes("v"),
@@ -517,8 +510,8 @@ describe("backpressure", () => {
     );
   });
 
-  it("holds the writer in needle mode", async () => {
-    await assertBounded(createNeedleTransformStream({ needles: { "{{a}}": "v" } }));
+  it("holds the writer in literal mode", async () => {
+    await assertBounded(nativeLiteralStream({ literals: { "{{a}}": "v" } }));
   });
 });
 
@@ -569,7 +562,7 @@ describe("zero-copy output", () => {
   it("copies almost nothing on a sparse body", async () => {
     const input = shell(6, (i) => `{{h${i}}}`);
     const { copied, viewed } = await copyRatio(input, () =>
-      createTokenTransformStream({
+      nativeTokenStream({
         open: "{{",
         close: "}}",
         resolve: () => bytes("value"),
@@ -580,10 +573,10 @@ describe("zero-copy output", () => {
     expect(viewed).toBeGreaterThan(input.length - 1024);
   });
 
-  it("copies almost nothing on a sparse body in needle mode", async () => {
+  it("copies almost nothing on a sparse body in literal mode", async () => {
     const input = shell(6, () => "__ID__");
     const { copied, viewed } = await copyRatio(input, () =>
-      createNeedleTransformStream({ needles: { __ID__: "value" } }),
+      nativeLiteralStream({ literals: { __ID__: "value" } }),
     );
     expect(copied).toBeLessThan(1024);
     expect(viewed).toBeGreaterThan(input.length - 1024);
@@ -593,7 +586,7 @@ describe("zero-copy output", () => {
     // A hole every ~60 bytes: every span is small, so merging is worth it.
     const input = bytes(`${"x".repeat(56)}{{a}}`.repeat(2000));
     const { parts } = await copyRatio(input, () =>
-      createTokenTransformStream({ open: "{{", close: "}}", resolve: () => bytes("v") }),
+      nativeTokenStream({ open: "{{", close: "}}", resolve: () => bytes("v") }),
     );
     // Without the accumulator this would be one part per span and per value.
     expect(parts).toBeLessThan(50);
@@ -607,7 +600,7 @@ const gc = (globalThis as { gc?: () => void }).gc;
 /** Write chunks one at a time, reading each enqueue before the next write, and
  *  never retaining an output view. */
 async function pipeStats(chunks: () => Generator<Uint8Array>) {
-  const tx = createTokenTransformStream({ open, close, resolve: () => value });
+  const tx = nativeTokenStream({ open, close, resolve: () => value });
   const writer = tx.writable.getWriter();
   const reader = tx.readable.getReader();
   let total = 0;
@@ -653,7 +646,7 @@ describe("memory", () => {
   }, 60_000);
 
   it.skipIf(!gc)("does not retain input chunks across transform calls", async () => {
-    const tx = createTokenTransformStream({ open, close, resolve: () => value });
+    const tx = nativeTokenStream({ open, close, resolve: () => value });
     const writer = tx.writable.getWriter();
     const reader = tx.readable.getReader();
 
@@ -708,7 +701,7 @@ describe("async cancellation", () => {
       const abort = new AbortController();
       const failure = new Error("request cancelled");
       if (preAborted) abort.abort(failure);
-      const stream = createAsyncTokenTransformStream({
+      const stream = nativeTokenStream({
         open: "{{",
         close: "}}",
         signal: abort.signal,
@@ -733,9 +726,10 @@ describe("async cancellation", () => {
   it("detaches pending work on readable cancellation", async () => {
     const gate = deferred<Uint8Array | null>();
     const started = deferred<void>();
-    const stream = createAsyncTokenTransformStream({
+    const stream = nativeTokenStream({
       open: "{{",
       close: "}}",
+      concurrency: 1,
       resolve: () => {
         started.resolve();
         return gate.promise;
@@ -759,10 +753,11 @@ describe("async cancellation", () => {
       const abort = new AbortController();
       let calls = 0;
       let recovered = 0;
-      const body = createAsyncTokenTransformer({
+      const body = createTokenTransformer({
         open: "{{",
         close: "}}",
         signal: abort.signal,
+        concurrency: 1,
         resolve: () => {
           calls++;
           return gate.promise;
@@ -789,7 +784,7 @@ describe("async cancellation", () => {
       const abort = new AbortController();
       const failure = new Error("abort in resolver");
       let calls = 0;
-      const body = createAsyncTokenTransformer({
+      const body = createTokenTransformer({
         open: "{{",
         close: "}}",
         signal: abort.signal,
@@ -805,9 +800,10 @@ describe("async cancellation", () => {
   }
 
   it("preserves undefined rejection reasons", async () => {
-    const body = createAsyncTokenTransformer({
+    const body = createTokenTransformer({
       open: "{{",
       close: "}}",
+      concurrency: 1,
       resolve: () => Promise.reject(undefined),
     });
     await expect(body.transform(bytes("{{a}}"), ctrl)).rejects.toBeUndefined();
@@ -817,7 +813,7 @@ describe("async cancellation", () => {
   it("rejects a pre-aborted signal without calling the resolver", async () => {
     const abort = new AbortController();
     abort.abort("stop");
-    const body = createAsyncTokenTransformer({
+    const body = createTokenTransformer({
       open: "{{",
       close: "}}",
       signal: abort.signal,
@@ -838,7 +834,7 @@ describe("first output", () => {
       },
     });
     const failure = new Error("enqueue failed");
-    const body = createAsyncTokenTransformer({
+    const body = createTokenTransformer({
       open: "{{",
       close: "}}",
       resolve: () => gate.promise,
@@ -856,7 +852,7 @@ describe("first output", () => {
   for (const prefix of ["<head>", "{{fast}}", "{{promised}}"]) {
     it(`delivers ${prefix} before a later lookup settles`, async () => {
       const gate = deferred<Uint8Array | null>();
-      const stream = createAsyncTokenTransformStream({
+      const stream = nativeTokenStream({
         open: "{{",
         close: "}}",
         resolve: (payload) => {
@@ -896,9 +892,10 @@ describe("first output", () => {
     const ctrl = {
       enqueue: (part: Uint8Array) => parts.push(part),
     } as unknown as TransformStreamDefaultController<Uint8Array>;
-    const body = createAsyncTokenTransformer({
+    const body = createTokenTransformer({
       open: "{{",
       close: "}}",
+      concurrency: 1,
       resolve: async () => bytes("X"),
     });
     await body.transform(bytes(`head${"{{x}}".repeat(100)}`), ctrl);
@@ -910,7 +907,7 @@ describe("first output", () => {
   it("handles an enqueue failure at the first await", async () => {
     const gate = deferred<Uint8Array | null>();
     const failure = new Error("enqueue failed");
-    const body = createAsyncTokenTransformer({
+    const body = createTokenTransformer({
       open: "{{",
       close: "}}",
       resolve: () => gate.promise,

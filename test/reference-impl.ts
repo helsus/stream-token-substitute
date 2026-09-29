@@ -1,4 +1,4 @@
-import { compileOptions, type TokenResolver, type TokenTransformOptions } from "../src/types.ts";
+import { compileOptions, type TokenTransformOptions } from "../src/types.ts";
 
 function matchesAt(input: Uint8Array, at: number, pat: Uint8Array): boolean {
   if (at + pat.length > input.length) return false;
@@ -23,9 +23,8 @@ function isTruncatedPrefix(input: Uint8Array, at: number, pat: Uint8Array): bool
  *  Deliberately naive. Do not optimize. */
 export function substituteBytes(input: Uint8Array, options: TokenTransformOptions): Uint8Array {
   const { openBytes, closeBytes, validate, maxPayloadBytes } = compileOptions(options);
-  // compileOptions widens `resolve` to the async signature for the shared path.
-  // The reference is sync by construction and is only ever given a sync one.
-  const resolve = options.resolve as TokenResolver;
+  // The reference is sync by construction and is only ever given byte results.
+  const resolve = options.resolve as (payload: Uint8Array) => Uint8Array | null;
 
   if (!(input instanceof Uint8Array)) throw new TypeError("input must be a Uint8Array");
 

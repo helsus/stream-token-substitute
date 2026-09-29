@@ -2,78 +2,78 @@
 
 import { describe, expect, it } from "vitest";
 import { resolveFrom, substituteResponse } from "../src/helpers.ts";
-import { attrEscapeBytes, htmlEscapeBytes } from "../src/html-escape.ts";
-import { jsonEscapeBytes } from "../src/json-escape.ts";
+import { escapeAttr, escapeHtml } from "../src/html-escape.ts";
+import { escapeJson } from "../src/json-escape.ts";
 import { bytes, decoder, encoder } from "./helpers.ts";
 
 const esc = (fn: (src: Uint8Array) => Uint8Array, text: string): string =>
   decoder.decode(fn(bytes(text)));
 
-describe("htmlEscapeBytes", () => {
+describe("escapeHtml", () => {
   it("escapes the five text-context bytes", () => {
-    expect(esc(htmlEscapeBytes, `<a href="x">&'`)).toBe("&lt;a href=&quot;x&quot;&gt;&amp;&#x27;");
+    expect(esc(escapeHtml, `<a href="x">&'`)).toBe("&lt;a href=&quot;x&quot;&gt;&amp;&#x27;");
   });
 
   it("returns src itself when nothing needs escaping", () => {
     const src = bytes("plain text 123");
-    expect(htmlEscapeBytes(src)).toBe(src);
+    expect(escapeHtml(src)).toBe(src);
   });
 
   it("leaves multi-byte utf-8 and invalid bytes untouched", () => {
-    const src = new Uint8Array([...bytes("héllo中文"), 0xff, 0xc0]);
-    expect(htmlEscapeBytes(src)).toBe(src);
+    const src = new Uint8Array([...bytes("h\u00e9llo\u4e2d\u6587"), 0xff, 0xc0]);
+    expect(escapeHtml(src)).toBe(src);
   });
 
   it("neutralizes a script-closing payload", () => {
-    expect(esc(htmlEscapeBytes, "</script><img onerror=alert(1)>")).not.toContain("<");
+    expect(esc(escapeHtml, "</script><img onerror=alert(1)>")).not.toContain("<");
   });
 
   it("allocates exactly the bytes it writes", () => {
-    const out = htmlEscapeBytes(bytes("<>&"));
+    const out = escapeHtml(bytes("<>&"));
     expect(out.byteLength).toBe(out.length);
     expect(decoder.decode(out)).toBe("&lt;&gt;&amp;");
   });
 
   it("rejects a non-Uint8Array", () => {
-    expect(() => htmlEscapeBytes("x" as unknown as Uint8Array)).toThrow(TypeError);
+    expect(() => escapeHtml("x" as unknown as Uint8Array)).toThrow(TypeError);
   });
 });
 
-describe("attrEscapeBytes", () => {
-  it("escapes everything htmlEscapeBytes does", () => {
-    expect(esc(attrEscapeBytes, "<>&\"'")).toBe("&lt;&gt;&amp;&quot;&#x27;");
+describe("escapeAttr", () => {
+  it("escapes everything escapeHtml does", () => {
+    expect(esc(escapeAttr, "<>&\"'")).toBe("&lt;&gt;&amp;&quot;&#x27;");
   });
 
   it("escapes the bytes that break out of an unquoted attribute", () => {
     // <div class=VALUE> with VALUE ending an unquoted attribute must not be
     // able to start a new one.
-    expect(esc(attrEscapeBytes, "x onerror=alert(1)")).toBe("x&#x20;onerror&#x3D;alert(1)");
-    expect(esc(attrEscapeBytes, "a\tb\nc\rd/e`f")).toBe("a&#x9;b&#xA;c&#xD;d&#x2F;e&#x60;f");
+    expect(esc(escapeAttr, "x onerror=alert(1)")).toBe("x&#x20;onerror&#x3D;alert(1)");
+    expect(esc(escapeAttr, "a\tb\nc\rd/e`f")).toBe("a&#x9;b&#xA;c&#xD;d&#x2F;e&#x60;f");
   });
 
   it("returns src itself for an already-safe value", () => {
     const src = bytes("safe-value_123");
-    expect(attrEscapeBytes(src)).toBe(src);
+    expect(escapeAttr(src)).toBe(src);
   });
 });
 
-describe("jsonEscapeBytes sizing", () => {
+describe("escapeJson sizing", () => {
   it("returns a buffer with no slack", () => {
-    const out = jsonEscapeBytes(bytes('a"b\\c\nde'));
+    const out = escapeJson(bytes('a"b\\c\nde'));
     expect(out.byteLength).toBe(out.length);
     expect(out.buffer.byteLength).toBe(out.length);
     expect(decoder.decode(out)).toBe('a\\"b\\\\c\\nd\\u0001e');
   });
 
   it("sizes U+2028 and U+2029 exactly", () => {
-    const out = jsonEscapeBytes(bytes("a b c"));
+    const out = escapeJson(bytes("a\u2028b\u2029c"));
     expect(out.buffer.byteLength).toBe(out.length);
     expect(decoder.decode(out)).toBe("a\\u2028b\\u2029c");
   });
 
   it("does not over-allocate for a long mostly-clean value", () => {
     const src = bytes(`${"x".repeat(4096)}<`);
-    const out = jsonEscapeBytes(src);
+    const out = escapeJson(src);
     expect(out.buffer.byteLength).toBe(4096 + 6);
   });
 });
@@ -129,8 +129,8 @@ describe("resolveFrom", () => {
   });
 
   it("handles multi-byte names", () => {
-    const resolve = resolveFrom({ 名前: "Ada" });
-    expect(decoder.decode(resolve(bytes("名前")) as Uint8Array)).toBe("Ada");
+    const resolve = resolveFrom({ "\u540d\u524d": "Ada" });
+    expect(decoder.decode(resolve(bytes("\u540d\u524d")) as Uint8Array)).toBe("Ada");
   });
 });
 
@@ -147,19 +147,21 @@ describe("substituteResponse", () => {
   });
 
   it("drops the headers that no longer describe the body", async () => {
+    const stale = {
+      "content-length": "11",
+      "content-encoding": "gzip",
+      etag: '"abc"',
+      digest: "sha-256=x",
+      "content-digest": "sha-256=:x:",
+      "repr-digest": "sha-256=:x:",
+      "content-md5": "x",
+      "accept-ranges": "bytes",
+    };
     const upstream = new Response("hi {{name}}", {
-      headers: {
-        "content-type": "text/html",
-        "content-length": "11",
-        etag: '"abc"',
-        digest: "sha-256=x",
-        "cache-control": "public",
-      },
+      headers: { ...stale, "content-type": "text/html", "cache-control": "public" },
     });
     const res = substituteResponse(upstream, options);
-    expect(res.headers.get("content-length")).toBeNull();
-    expect(res.headers.get("etag")).toBeNull();
-    expect(res.headers.get("digest")).toBeNull();
+    for (const name of Object.keys(stale)) expect(res.headers.get(name)).toBeNull();
     expect(res.headers.get("content-type")).toBe("text/html");
     expect(res.headers.get("cache-control")).toBe("public");
   });
@@ -173,16 +175,41 @@ describe("substituteResponse", () => {
     expect(res.statusText).toBe("Transformed");
   });
 
+  it("rejects partial content", () => {
+    const partial = new Response("{{name}}", { status: 206 });
+    expect(() => substituteResponse(partial, options)).toThrow(/partial content/);
+    const ranged = new Response("{{name}}", { headers: { "content-range": "bytes 0-7/100" } });
+    expect(() => substituteResponse(ranged, options)).toThrow(TypeError);
+  });
+
+  it("applies backpressure inside a chunk by default", async () => {
+    let calls = 0;
+    const tokens = "{{x}}".repeat(100);
+    const res = substituteResponse(new Response(tokens), {
+      open: "{{",
+      close: "}}",
+      resolve: () => {
+        calls++;
+        return new Uint8Array(256 * 1024);
+      },
+    });
+    const reader = res.body?.getReader();
+    if (reader === undefined) throw new Error("no body");
+    await reader.read();
+    await reader.cancel();
+    expect(calls).toBeLessThan(10);
+  });
+
   it("returns a bodyless response untouched", () => {
     const upstream = new Response(null, { status: 204 });
     expect(substituteResponse(upstream, options)).toBe(upstream);
   });
 
   it("accepts a prebuilt TransformStream, which is how async resolvers get in", async () => {
-    const { createAsyncTokenTransformStream } = await import("../src/async-transformer.ts");
+    const { nativeTokenStream } = await import("./helpers.ts");
     const res = substituteResponse(
       new Response("hi {{name}}"),
-      createAsyncTokenTransformStream({
+      nativeTokenStream({
         open: "{{",
         close: "}}",
         resolve: async () => bytes("Async"),
@@ -192,12 +219,12 @@ describe("substituteResponse", () => {
   });
 });
 
-const escJson = (s: string) => decoder.decode(jsonEscapeBytes(encoder.encode(s)));
+const escJson = (s: string) => decoder.decode(escapeJson(encoder.encode(s)));
 
-describe("jsonEscapeBytes", () => {
+describe("escapeJson", () => {
   it("returns src itself when nothing needs escaping", () => {
     const src = encoder.encode("plain text 123");
-    expect(jsonEscapeBytes(src)).toBe(src);
+    expect(escapeJson(src)).toBe(src);
   });
 
   it("escapes quotes and backslashes", () => {
@@ -252,21 +279,21 @@ describe("jsonEscapeBytes", () => {
 
   it("passes invalid UTF-8 through untouched", () => {
     const src = new Uint8Array([0xff, 0xfe, 0xc0, 0x80, 0xe2, 0x80, 0x41]);
-    expect([...jsonEscapeBytes(src)]).toEqual([...src]);
+    expect([...escapeJson(src)]).toEqual([...src]);
   });
 
   it("escapes only the listed bytes around invalid UTF-8", () => {
     const src = new Uint8Array([0xff, 0x22, 0xc0]);
-    expect([...jsonEscapeBytes(src)]).toEqual([0xff, 0x5c, 0x22, 0xc0]);
+    expect([...escapeJson(src)]).toEqual([0xff, 0x5c, 0x22, 0xc0]);
   });
 
   it("handles a truncated U+2028 prefix at the end", () => {
     const src = new Uint8Array([0x22, 0xe2, 0x80]);
-    expect([...jsonEscapeBytes(src)]).toEqual([0x5c, 0x22, 0xe2, 0x80]);
+    expect([...escapeJson(src)]).toEqual([0x5c, 0x22, 0xe2, 0x80]);
   });
 
   it("rejects non-Uint8Array input", () => {
     // biome-ignore lint/suspicious/noExplicitAny: testing runtime validation
-    expect(() => jsonEscapeBytes("x" as any)).toThrow(TypeError);
+    expect(() => escapeJson("x" as any)).toThrow(TypeError);
   });
 });

@@ -3,12 +3,10 @@ import { BLOCKED, BUFFER_LIMIT, type OutputController } from "./flow.ts";
 
 type Controller = TransformStreamDefaultController<Uint8Array>;
 
-/** Where the curves cross: below this the extra read and microtask cost more
- *  than the memcpy, above it the memcpy does. */
+/** Below this a memcpy is cheaper than an extra read and microtask. */
 const PASS_THROUGH_BYTES = 1024;
 
-/** Output accumulator. Small pieces are merged once they reach `flushBytes`,
- *  trading a memcpy for far fewer enqueued parts. */
+/** Output accumulator that merges small pieces up to `flushBytes`. */
 export class Emitter {
   private controller: OutputController | undefined;
   bytesOut = 0;
@@ -26,18 +24,18 @@ export class Emitter {
     this.passThrough = Math.min(PASS_THROUGH_BYTES, flushBytes);
   }
 
-  get ctrl(): Controller | undefined {
+  get ctrl(): OutputController | undefined {
     return this.controller;
   }
 
-  set ctrl(ctrl: Controller | undefined) {
+  set ctrl(ctrl: OutputController | undefined) {
     this.controller = ctrl;
     this.limit = Math.min(this.flushBytes, this.controller?.[BUFFER_LIMIT] ?? this.flushBytes);
     this.passThrough = Math.min(PASS_THROUGH_BYTES, this.limit);
   }
 
   get blocked(): boolean {
-    return (this.ctrl as OutputController | undefined)?.[BLOCKED]?.() === true;
+    return this.controller?.[BLOCKED]?.() === true;
   }
 
   emit(part: Uint8Array): void {

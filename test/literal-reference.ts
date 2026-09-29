@@ -1,4 +1,4 @@
-import { compileNeedleOptions, type NeedleTransformOptions } from "../src/needles.ts";
+import { compileLiteralOptions, type LiteralTransformOptions } from "../src/literals.ts";
 
 function matchesAt(input: Uint8Array, at: number, pat: Uint8Array): boolean {
   if (at + pat.length > input.length) return false;
@@ -8,12 +8,15 @@ function matchesAt(input: Uint8Array, at: number, pat: Uint8Array): boolean {
   return true;
 }
 
-/** Non-streaming equivalent and normative reference for the needle transformer.
+/** Non-streaming equivalent and normative reference for the literal transformer.
  *  Leftmost-longest, no re-scan of substituted bytes.
  *  Deliberately naive. Do not optimize. */
-export function substituteNeedles(input: Uint8Array, options: NeedleTransformOptions): Uint8Array {
-  const { set, resolve } = compileNeedleOptions(options);
-  const needles = set.needles;
+export function substituteLiterals(
+  input: Uint8Array,
+  options: LiteralTransformOptions,
+): Uint8Array {
+  const { set, resolve } = compileLiteralOptions(options);
+  const literals = set.literals;
   const out: Uint8Array[] = [];
   let contentStart = 0;
   let i = 0;
@@ -21,11 +24,11 @@ export function substituteNeedles(input: Uint8Array, options: NeedleTransformOpt
   while (i < input.length) {
     let best = -1;
     let bestLen = 0;
-    for (let n = 0; n < needles.length; n++) {
-      const needle = needles[n];
-      if (needle.length > bestLen && matchesAt(input, i, needle)) {
+    for (let n = 0; n < literals.length; n++) {
+      const literal = literals[n];
+      if (literal.length > bestLen && matchesAt(input, i, literal)) {
         best = n;
-        bestLen = needle.length;
+        bestLen = literal.length;
       }
     }
     if (best < 0) {

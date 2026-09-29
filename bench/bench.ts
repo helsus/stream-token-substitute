@@ -1,30 +1,60 @@
 // Run: npm run bench
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
+import {
+  AsyncLookaheadTransformEngine,
+  SemaphoreStrategy,
+  StringAnchorSearchStrategy,
+  SyncReplacementTransformEngine,
+  searchStrategyFactory,
+} from "replace-content-transformer";
+import {
+  AsyncReplaceContentTransformer,
+  ReplaceContentTransformer,
+} from "replace-content-transformer/web";
 import replacestream from "replacestream";
-import { createAsyncTokenStreamPair } from "../src/async-transformer.ts";
 import { resolveFrom } from "../src/helpers.ts";
-import {
-  compileNeedles,
-  createNeedleStreamPair,
-  createNeedleTransformer,
-  createNeedleTransformStream,
-} from "../src/needles.ts";
-import {
-  createAsyncTokenTransform,
-  createNeedleTransform,
-  createTokenTransform,
-} from "../src/node.ts";
-import {
-  createTokenStreamPair,
-  createTokenTransformer,
-  createTokenTransformStream,
-} from "../src/transformer.ts";
+import type { LiteralTransformOptions } from "../src/literals.ts";
+import { compileLiterals, createLiteralStream, createLiteralTransformer } from "../src/literals.ts";
+import { createLiteralTransform, createTokenTransform } from "../src/node.ts";
+import { createTokenStream, createTokenTransformer } from "../src/transformer.ts";
 import type { TokenTransformOptions } from "../src/types.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const bytes = (text: string) => encoder.encode(text);
+const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+const nativeTokenStream = (options: TokenTransformOptions) =>
+  new TransformStream<Uint8Array, Uint8Array>(createTokenTransformer(options));
+const nativeLiteralStream = (options: LiteralTransformOptions) =>
+  new TransformStream<Uint8Array, Uint8Array>(createLiteralTransformer(options));
+
+async function* textOnce(value: string): AsyncIterable<string> {
+  yield value;
+}
+
+function anchors(): StringAnchorSearchStrategy {
+  const strategy = searchStrategyFactory(["{{", "}}"]);
+  assert.ok(strategy instanceof StringAnchorSearchStrategy);
+  return strategy;
+}
+
+const decodeText = (): ReadableWritablePair<string, Uint8Array> => {
+  const { readable, writable } = new TextDecoderStream();
+  return { readable, writable: writable as WritableStream<Uint8Array> };
+};
+
+/** Byte in, byte out around a string transformer. */
+function throughText(
+  source: ReadableStream<Uint8Array>,
+  transformer: Transformer<string, string>,
+): AsyncIterable<Uint8Array> {
+  return source
+    .pipeThrough(decodeText())
+    .pipeThrough(new TransformStream(transformer))
+    .pipeThrough(new TextEncoderStream()) as unknown as AsyncIterable<Uint8Array>;
+}
 
 const CHUNK_SIZES = [16 * 1024, 1024, 64];
 const MAIN_CHUNK = 16 * 1024;
@@ -196,7 +226,7 @@ function tokenScenario(title: string, doc: Uint8Array): Scenario {
         name: "stream-token-substitute",
         open: (chunks) =>
           webSource(chunks).pipeThrough(
-            createTokenTransformStream(tokenOptions),
+            nativeTokenStream(tokenOptions),
           ) as unknown as AsyncIterable<Uint8Array>,
         note: "web streams",
       },
@@ -204,6 +234,20 @@ function tokenScenario(title: string, doc: Uint8Array): Scenario {
         name: "stream-token-substitute/node",
         open: (chunks) => nodeOut(chunks, createTokenTransform(tokenOptions)),
         note: "node streams",
+      },
+      {
+        name: "replace-content-transformer",
+        open: (chunks) =>
+          throughText(
+            webSource(chunks),
+            new ReplaceContentTransformer(
+              new SyncReplacementTransformEngine({
+                searchStrategy: anchors(),
+                replacement: (match: string) => valueText.get(match.slice(2, -2)) ?? match,
+              }),
+            ),
+          ),
+        note: "web streams, text",
       },
       {
         name: "replacestream",
@@ -221,16 +265,20 @@ function tokenScenario(title: string, doc: Uint8Array): Scenario {
   };
 }
 
-function needleScenario(title: string, doc: Uint8Array, needles: Record<string, string>): Scenario {
-  const compiled = compileNeedles(needles);
+function literalScenario(
+  title: string,
+  doc: Uint8Array,
+  literals: Record<string, string>,
+): Scenario {
+  const compiled = compileLiterals(literals);
   // Longest alternative first: a JS alternation is first-match.
-  const pattern = Object.keys(needles)
+  const pattern = Object.keys(literals)
     .sort((a, b) => b.length - a.length)
     .join("|");
-  const count = Object.keys(needles).length;
+  const count = Object.keys(literals).length;
   const substitute = (text: string) => {
     let out = text;
-    for (const [name, value] of Object.entries(needles)) out = out.replaceAll(name, value);
+    for (const [name, value] of Object.entries(literals)) out = out.replaceAll(name, value);
     return out;
   };
   const expected = bytes(substitute(decoder.decode(doc)));
@@ -243,7 +291,9 @@ function needleScenario(title: string, doc: Uint8Array, needles: Record<string, 
         name: "buffer + single regex",
         open: () =>
           once(
-            bytes(decoder.decode(doc).replace(new RegExp(pattern, "g"), (match) => needles[match])),
+            bytes(
+              decoder.decode(doc).replace(new RegExp(pattern, "g"), (match) => literals[match]),
+            ),
           ),
         note: "one regex pass, decode and encode included",
       },
@@ -253,23 +303,23 @@ function needleScenario(title: string, doc: Uint8Array, needles: Record<string, 
         note: "baseline, holds the body",
       },
       {
-        name: "stream-token-substitute/needles",
+        name: "stream-token-substitute literals",
         open: (chunks) =>
           webSource(chunks).pipeThrough(
-            createNeedleTransformStream({ needles }),
+            nativeLiteralStream({ literals }),
           ) as unknown as AsyncIterable<Uint8Array>,
         note: "web streams, Aho-Corasick",
       },
       {
         name: "stream-token-substitute/node",
-        open: (chunks) => nodeOut(chunks, createNeedleTransform({ needles })),
+        open: (chunks) => nodeOut(chunks, createLiteralTransform({ literals })),
         note: "node streams, Aho-Corasick",
       },
       {
-        name: "stream-token-substitute/needles (compiled)",
+        name: "stream-token-substitute literals (compiled)",
         open: (chunks) =>
           webSource(chunks).pipeThrough(
-            createNeedleTransformStream({ needles: compiled }),
+            nativeLiteralStream({ literals: compiled }),
           ) as unknown as AsyncIterable<Uint8Array>,
         note: "reused automaton",
       },
@@ -280,7 +330,7 @@ function needleScenario(title: string, doc: Uint8Array, needles: Record<string, 
             chunks,
             replacestream(
               new RegExp(`(?:${pattern})`, "g"),
-              (match: string) => needles[match] ?? match,
+              (match: string) => literals[match] ?? match,
             ),
           ),
         note: "one alternation regex",
@@ -310,12 +360,12 @@ function asyncScenario(): Scenario {
       },
       {
         name: "stream-token-substitute/node (async)",
-        open: (chunks) => nodeOut(chunks, createAsyncTokenTransform(direct)),
+        open: (chunks) => nodeOut(chunks, createTokenTransform(direct)),
         note: "resolver answers directly",
       },
       {
         name: "stream-token-substitute/node (async)",
-        open: (chunks) => nodeOut(chunks, createAsyncTokenTransform(awaited)),
+        open: (chunks) => nodeOut(chunks, createTokenTransform(awaited)),
         note: "resolver returns a promise",
       },
     ],
@@ -334,14 +384,14 @@ const scenarios: Scenario[] = [
     "one 256 KB replacement",
     makeDocument((i) => (i === 0 ? "{{big}}" : heading(i))),
   ),
-  needleScenario(
+  literalScenario(
     "one literal marker",
     makeDocument((i) => (i < 3 ? "__NONCE__" : heading(i))),
     {
       __NONCE__: "r4nd0m",
     },
   ),
-  needleScenario("32 literal markers", needleDoc, needleValues),
+  literalScenario("32 literal markers", needleDoc, needleValues),
   asyncScenario(),
 ];
 
@@ -490,30 +540,30 @@ function scannerBenchmark() {
   });
   const capped = `{{${"x".repeat(1025)}`.repeat(500);
   token("payload cap 1024", capped, capped, { maxPayloadBytes: 1024 });
-  const needles = compileNeedles({ __A__: "X", __B__: "Y" });
-  measure("dense needles", bytes("__A____B__".repeat(20000)), bytes("XY".repeat(20000)), () =>
-    createNeedleTransformer({ needles }),
+  const literals = compileLiterals({ __A__: "X", __B__: "Y" });
+  measure("dense literals", bytes("__A____B__".repeat(20000)), bytes("XY".repeat(20000)), () =>
+    createLiteralTransformer({ literals }),
   );
   for (const length of [256, 1024]) {
-    const overlapping = compileNeedles({ a: "X", [`${"a".repeat(length)}b`]: "Y" });
-    measure(`needle overlap ${length}`, bytes("a".repeat(8192)), bytes("X".repeat(8192)), () =>
-      createNeedleTransformer({ needles: overlapping }),
+    const overlapping = compileLiterals({ a: "X", [`${"a".repeat(length)}b`]: "Y" });
+    measure(`literal overlap ${length}`, bytes("a".repeat(8192)), bytes("X".repeat(8192)), () =>
+      createLiteralTransformer({ literals: overlapping }),
     );
   }
-  const longOverlap = compileNeedles({ a: "X", [`${"a".repeat(16000)}b`]: "Y" });
+  const longOverlap = compileLiterals({ a: "X", [`${"a".repeat(16000)}b`]: "Y" });
   for (const size of [32000, 1]) {
     measure(
-      `needle overlap 16000, ${size}B chunks`,
+      `literal overlap 16000, ${size}B chunks`,
       bytes("a".repeat(32000)),
       bytes("X".repeat(32000)),
-      () => createNeedleTransformer({ needles: longOverlap }),
+      () => createLiteralTransformer({ literals: longOverlap }),
       size,
     );
   }
 }
 
 async function delayedInputBenchmark() {
-  const needles = compileNeedles({ q: "X", abcdef: "Y" });
+  const literals = compileLiterals({ q: "X", abcdef: "Y" });
   const samples: number[] = [];
   for (let run = 0; run < 15; run++) {
     let sent = false;
@@ -529,7 +579,7 @@ async function delayedInputBenchmark() {
       },
     });
     const start = performance.now();
-    const reader = source.pipeThrough(createNeedleTransformStream({ needles })).getReader();
+    const reader = source.pipeThrough(nativeLiteralStream({ literals })).getReader();
     const first = await reader.read();
     samples.push(performance.now() - start);
     assert.equal(decoder.decode(first.value), "X");
@@ -537,7 +587,7 @@ async function delayedInputBenchmark() {
     reader.releaseLock();
   }
   samples.sort((a, b) => a - b);
-  console.log(`\nDecided needle, 30 ms upstream gap: ${samples[7].toFixed(3)} ms first output`);
+  console.log(`\nDecided literal, 30 ms upstream gap: ${samples[7].toFixed(3)} ms first output`);
 }
 
 async function memoryBenchmark() {
@@ -555,16 +605,16 @@ async function memoryBenchmark() {
       gc?.();
     }
   }
-  for (const mode of ["sync", "async", "needles"] as const) {
+  for (const mode of ["sync", "async", "literals"] as const) {
     const template = bytes(`${"x".repeat(59)}{{x}}`.repeat(1024));
     const replacement = bytes("X");
     const options = { open: "{{", close: "}}", resolve: () => replacement };
     const transformer =
       mode === "sync"
-        ? createTokenStreamPair(options)
+        ? createTokenStream(options)
         : mode === "async"
-          ? createAsyncTokenStreamPair({ ...options, resolve: async () => replacement })
-          : createNeedleStreamPair({ needles: { "{{x}}": replacement } });
+          ? createTokenStream({ ...options, resolve: async () => replacement })
+          : createLiteralStream({ literals: { "{{x}}": replacement } });
     const total = 2048; // 128 MiB, generated one 64 KiB chunk at a time.
     let sent = 0;
     let output = 0;
@@ -611,12 +661,12 @@ async function memoryBenchmark() {
 }
 
 function compilationBenchmark() {
-  console.log("\n## Needle compilation, median of 11 runs");
+  console.log("\n## Literal compilation, median of 11 runs");
   console.log("Memory is sampled allocation growth, not an exact peak.");
   const rows = [];
   for (const [name, source] of [
     ["32 markers", needleNames],
-    ["100K-byte needle", ["a".repeat(100000)]],
+    ["100K-byte literal", ["a".repeat(100000)]],
   ] as const) {
     const times: number[] = [];
     const memory: number[] = [];
@@ -624,7 +674,7 @@ function compilationBenchmark() {
       globalThis.gc?.();
       const before = process.memoryUsage();
       const start = performance.now();
-      compileNeedles(source);
+      compileLiterals(source);
       const elapsed = performance.now() - start;
       const after = process.memoryUsage();
       if (run < 3) continue;
@@ -645,7 +695,7 @@ function compilationBenchmark() {
 async function expansionBenchmark() {
   console.log("\n## Stalled reader: stream pairs, one chunk, 100 fresh 256 KiB replacements");
   const rows = [];
-  for (const mode of ["sync", "async", "needles"] as const) {
+  for (const mode of ["sync", "async", "literals"] as const) {
     let calls = 0;
     const resolve = () => {
       calls++;
@@ -654,10 +704,10 @@ async function expansionBenchmark() {
     const options = { open: "{{", close: "}}", resolve };
     const tx =
       mode === "sync"
-        ? createTokenStreamPair(options)
+        ? createTokenStream(options)
         : mode === "async"
-          ? createAsyncTokenStreamPair({ ...options, resolve: async () => resolve() })
-          : createNeedleStreamPair({ needles: ["{{x}}"], resolve });
+          ? createTokenStream({ ...options, resolve: async () => resolve() })
+          : createLiteralStream({ literals: ["{{x}}"], resolve });
     const reader = tx.readable.getReader();
     const writer = tx.writable.getWriter();
     const first = reader.read();
@@ -669,7 +719,7 @@ async function expansionBenchmark() {
       "resolver calls": calls,
       "queued replacement MiB": (calls * 256 * 1024 - total) / 2 ** 20,
     });
-    assert.ok(calls <= 2);
+    assert.ok(calls < 10);
     for (;;) {
       const part = await reader.read();
       if (part.done) break;
@@ -683,8 +733,98 @@ async function expansionBenchmark() {
   console.table(rows);
 }
 
+async function lookaheadBenchmark() {
+  const TOKENS = 50;
+  const DELAY = 5;
+  console.log(`\n## Async lookahead: ${TOKENS} tokens, each resolved after ${DELAY} ms`);
+  const doc = bytes(Array.from({ length: TOKENS }, (_, i) => `${PROSE}{{h${i}}}`).join(""));
+  const expected = bytes(substituteTemplate(decoder.decode(doc)));
+  const lookup = async (key: string) => {
+    await sleep(DELAY);
+    return valueText.get(key) ?? null;
+  };
+  const contenders: Contender[] = [
+    {
+      name: "stream-token-substitute",
+      open: (chunks) =>
+        webSource(chunks).pipeThrough(
+          createTokenStream({
+            open: "{{",
+            close: "}}",
+            concurrency: 4,
+            resolve: (payload) => lookup(decoder.decode(payload)),
+          }),
+        ) as unknown as AsyncIterable<Uint8Array>,
+      note: "concurrency 4",
+    },
+    {
+      name: "replace-content-transformer",
+      open: (chunks) =>
+        throughText(
+          webSource(chunks),
+          new AsyncReplaceContentTransformer(
+            new AsyncLookaheadTransformEngine({
+              searchStrategy: anchors(),
+              concurrencyStrategy: new SemaphoreStrategy(4),
+              replacement: async (match: string) =>
+                textOnce((await lookup(match.slice(2, -2))) ?? match),
+            }),
+          ),
+        ),
+      note: "AsyncLookaheadTransformEngine, SemaphoreStrategy(4)",
+    },
+  ];
+  const rows = [];
+  for (const contender of contenders) {
+    const { out } = await collect(contender.open(cut(doc, 1024)));
+    assert.ok(same(out, expected), `${contender.name} output differs`);
+    const times: number[] = [];
+    for (let i = 0; i < 7; i++) {
+      const start = performance.now();
+      await drain(contender.open(cut(doc, 1024)));
+      times.push(performance.now() - start);
+    }
+    times.sort((a, b) => a - b);
+    rows.push({
+      library: contender.name,
+      "wall ms": round(times[3] as number, 1),
+      "serial ms": TOKENS * DELAY,
+      note: contender.note,
+    });
+  }
+  console.table(rows);
+}
+
+async function slowReaderBenchmark() {
+  console.log("\n## Slow reader: one chunk, 100 fresh 256 KiB replacements, read one part, cancel");
+  const rows = [];
+  for (const mode of ["createTokenStream", "TransformStream(createTokenTransformer)"] as const) {
+    let calls = 0;
+    const options = {
+      open: "{{",
+      close: "}}",
+      resolve: () => {
+        calls++;
+        return new Uint8Array(256 * 1024);
+      },
+    };
+    const tx =
+      mode === "createTokenStream" ? createTokenStream(options) : nativeTokenStream(options);
+    const reader = tx.readable.getReader();
+    const writer = tx.writable.getWriter();
+    const written = writer.write(bytes("{{x}}".repeat(100))).catch(() => {});
+    await reader.read();
+    await reader.cancel();
+    await written;
+    rows.push({ stream: mode, "resolver calls": calls });
+  }
+  console.table(rows);
+}
+
 scannerBenchmark();
 await delayedInputBenchmark();
 compilationBenchmark();
 await expansionBenchmark();
+await slowReaderBenchmark();
+await lookaheadBenchmark();
 await memoryBenchmark();

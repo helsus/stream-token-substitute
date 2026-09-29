@@ -1,14 +1,16 @@
-import { createAsyncTokenTransformStream } from "../src/async-transformer.ts";
-import { createTokenTransformStream } from "../src/transformer.ts";
-import type {
-  AsyncTokenTransformOptions,
-  TokenResolver,
-  TokenTransformOptions,
-} from "../src/types.ts";
+import { createLiteralTransformer, type LiteralTransformOptions } from "../src/literals.ts";
+import { createTokenTransformer } from "../src/transformer.ts";
+import type { TokenResolver, TokenTransformOptions } from "../src/types.ts";
 
 export const encoder = new TextEncoder();
 export const decoder = new TextDecoder();
 export const bytes = (s: string) => encoder.encode(s);
+
+export const nativeTokenStream = (options: TokenTransformOptions) =>
+  new TransformStream<Uint8Array, Uint8Array>(createTokenTransformer(options));
+
+export const nativeLiteralStream = (options: LiteralTransformOptions) =>
+  new TransformStream<Uint8Array, Uint8Array>(createLiteralTransformer(options));
 
 export function concat(parts: Uint8Array[]): Uint8Array {
   let total = 0;
@@ -27,7 +29,7 @@ export async function runStreamParts(
   chunks: Uint8Array[],
   options: TokenTransformOptions,
 ): Promise<Uint8Array[]> {
-  const tx = createTokenTransformStream(options);
+  const tx = nativeTokenStream(options);
   const writer = tx.writable.getWriter();
   const reader = tx.readable.getReader();
   const out: Uint8Array[] = [];
@@ -61,9 +63,9 @@ export async function runStream(
 /** Same, through the async transformer. */
 export async function runAsyncStreamParts(
   chunks: Uint8Array[],
-  options: AsyncTokenTransformOptions,
+  options: TokenTransformOptions,
 ): Promise<Uint8Array[]> {
-  const tx = createAsyncTokenTransformStream(options);
+  const tx = nativeTokenStream(options);
   const writer = tx.writable.getWriter();
   const reader = tx.readable.getReader();
   const out: Uint8Array[] = [];
@@ -89,7 +91,7 @@ export async function runAsyncStreamParts(
 
 export async function runAsyncStream(
   chunks: Uint8Array[],
-  options: AsyncTokenTransformOptions,
+  options: TokenTransformOptions,
 ): Promise<Uint8Array> {
   return concat(await runAsyncStreamParts(chunks, options));
 }
@@ -101,7 +103,7 @@ export async function runAsyncStream(
 export function deferResolver(
   resolve: TokenResolver,
   mode: "sync" | "micro" | "macro" = "micro",
-): (payload: Uint8Array) => Uint8Array | null | Promise<Uint8Array | null> {
+): TokenResolver {
   return (payload) => {
     // The payload handed to an async resolver must survive the await, so a
     // correct implementation can read it after suspending. Read it late on

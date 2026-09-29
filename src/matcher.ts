@@ -1,6 +1,4 @@
-/** KMP delimiter matcher. Whole state is `k`, the matched prefix length, so a
- *  partial match survives chunk boundaries. Held bytes are always
- *  `delim.subarray(0, k)`, never a view into an input chunk. */
+/** KMP delimiter matcher. State is `k`, so a partial match survives chunks. */
 
 export const ADVANCED = 0;
 export const COMPLETE = 1;
@@ -42,9 +40,7 @@ export class DelimiterMatcher {
     this.released = 0;
   }
 
-  /** COMPLETE: full match, k reset to 0.
-   *  ADVANCED: match extended, possibly after fallback; `released` bytes dropped.
-   *  REJECTED: no match; all held bytes released and `byte` is the caller's to handle. */
+  /** COMPLETE resets k. ADVANCED drops `released` bytes. REJECTED releases all held bytes. */
   feed(byte: number): MatchResult {
     const pat = this.pat;
     if (pat.length === 1) {

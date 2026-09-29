@@ -1,12 +1,12 @@
-import { copyBytes, EMPTY, requeue } from "./bytes.ts";
-import { flowStream } from "./flow.ts";
+import { copyBytes, EMPTY, encodeText, requeue } from "./bytes.ts";
+import { checkSignal, type FlowBody, flowStream } from "./flow.ts";
 import { COMPLETE, DelimiterMatcher, REJECTED } from "./matcher.ts";
 import { Emitter } from "./output.ts";
 import {
-  type AsyncTokenResolver,
   compileOptions,
   type PayloadValidator,
   type ResolveErrorHandler,
+  type TokenResolver,
   type TokenStats,
   type TokenTransformer,
   type TokenTransformOptions,
@@ -15,39 +15,103 @@ import {
 const OUTSIDE = 0;
 const IN_TOKEN = 1;
 
-/** Payload views up to this length are cached per length. A validator is called
- *  once per committed byte, and without the cache every call allocates a fresh
- *  subarray over the same scratch. */
+/** Cached payload views per length, so validator calls allocate nothing. */
 const VIEW_CACHE_MAX = 128;
+
+/** Bytes held behind pending slots before scanning waits. */
+const HELD_LIMIT = 65536;
 
 type Controller = TransformStreamDefaultController<Uint8Array>;
 
-/**
- * Byte scanner behind createTokenTransformStream.
- *
- * Carried state across chunks is integers plus the payload scratch: partial
- * delimiter matches live in the matchers' `k`, never as indices into a chunk.
- *
- * `carry` is the number of held open-candidate bytes that are NOT backed by the
- * current chunk's pending span (they arrived in an earlier chunk, or came off the
- * re-scan queue). Released bytes are emitted only up to `carry`; the rest are
- * still covered by the pending span, which keeps non-token output maximal.
- *
- * All scan state lives in fields, which is what makes the scanner resumable: the
- * async subclass parks at a completed token and re-enters `pump()` unchanged.
- * Not part of the public API.
- */
+/** A pending token plus the output queued behind it. */
+interface Slot {
+  owner: Substituter | undefined;
+  /** undefined while pending. A drained stream becomes EMPTY. */
+  value: Uint8Array | AsyncIterator<Uint8Array> | undefined;
+  /** Rejected: value is the payload, emitted between the delimiters. */
+  verbatim: boolean;
+  /** Copy for onResolveError and a late null. */
+  payload: Uint8Array;
+  reading: boolean;
+  /** Already went through onResolveError. */
+  recovered: boolean;
+  after: Uint8Array[];
+  /** Bytes this slot contributes to `held`. */
+  held: number;
+}
+
+const noop = () => {};
+
+function isObject(value: unknown): value is object {
+  return value !== null && (typeof value === "object" || typeof value === "function");
+}
+
+/** The iterator of a stream or async iterable result, or undefined. */
+function iteratorOf(value: unknown): AsyncIterator<Uint8Array> | undefined {
+  if (!isObject(value) || !(Symbol.asyncIterator in value)) return undefined;
+  const make = value[Symbol.asyncIterator];
+  return typeof make === "function" ? make.call(value) : undefined;
+}
+
+function invalid(value: unknown): TypeError {
+  const kind = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+  return new TypeError(
+    `resolve must return Uint8Array, string, null, a stream, or a promise of one; got ${kind}`,
+  );
+}
+
+/** A native promise for a thenable, or undefined. Reads `then` once. */
+function toPromise(value: unknown): Promise<unknown> | undefined {
+  // Normalize subclasses, while leaving ordinary native promises alone.
+  if (value instanceof Promise) return Promise.resolve(value);
+  if (!isObject(value) || value instanceof Uint8Array) return undefined;
+  const then: unknown = Reflect.get(value, "then");
+  if (typeof then !== "function") return undefined;
+  // biome-ignore lint/suspicious/noThenProperty: intentional thenable assimilation
+  return Promise.resolve({ then: then.bind(value) });
+}
+
+function quiet(pending: unknown): void {
+  if (pending instanceof Promise) Promise.prototype.then.call(pending, undefined, noop);
+}
+
+/** Cancel a stream nobody will read. */
+function closeIterator(iter: AsyncIterator<Uint8Array> | undefined): void {
+  try {
+    quiet(iter?.return?.());
+  } catch {}
+}
+
+function releaseSlot(slot: Slot): void {
+  slot.owner = undefined;
+  slot.after.length = 0;
+  slot.payload = EMPTY;
+  const value = slot.value;
+  slot.value = EMPTY;
+  if (value !== undefined && !(value instanceof Uint8Array)) closeIterator(value);
+}
+
+interface Waiter {
+  resolve: () => void;
+  reject: (reason: unknown) => void;
+}
+
+/** Token scanner. State lives in fields, so it can halt and resume at a token boundary. */
 export class Substituter {
   paused = false;
   private readonly openBytes: Uint8Array;
   private readonly closeBytes: Uint8Array;
   private readonly openFirst: number;
   private readonly closeFirst: number;
-  protected readonly resolve: AsyncTokenResolver;
+  private readonly resolve: TokenResolver;
+  private readonly borrows: boolean;
+  private readonly concurrency: number;
   private readonly validate: PayloadValidator | undefined;
-  protected readonly onResolveError: ResolveErrorHandler | undefined;
+  private readonly onResolveError: ResolveErrorHandler | undefined;
   private readonly onDone: ((stats: TokenStats) => void) | undefined;
+  private readonly onClose: (failure?: { reason: unknown }) => void;
   private readonly maxPayloadBytes: number;
+  private readonly scratchLimit: number;
   private readonly openM: DelimiterMatcher;
   private readonly closeM: DelimiterMatcher;
 
@@ -56,54 +120,81 @@ export class Substituter {
 
   private state: typeof OUTSIDE | typeof IN_TOKEN = OUTSIDE;
   private carry = 0;
-  protected payload: Uint8Array;
-  protected payloadLen = 0;
+  // The payload is payload[base..payloadEnd).
+  private payload: Uint8Array;
+  private base = 0;
+  private payloadEnd = 0;
   // Cached payload.subarray(0, len) by len, dropped when the scratch grows.
   private payloadViews: (Uint8Array | undefined)[] = [];
 
+  // Open positions in the payload, so a cap abort without a validator stays linear.
+  private readonly openScan: DelimiterMatcher | undefined;
+  private scanned = 0;
+  private opens: number[] = [];
+  private openHead = 0;
+
   // Chunks may be backed by any ArrayBufferLike, including SharedArrayBuffer.
   private chunk: Uint8Array<ArrayBufferLike> = EMPTY;
+  private scanning = false;
 
-  // The buffer being scanned: the chunk, or the re-scan queue. `srcOwned` marks
-  // one the scanner reuses, whose spans must be copied to be emitted.
+  // `srcOwned`: src is a reused scratch, so its spans are copied out.
   private src: Uint8Array<ArrayBufferLike> = EMPTY;
   private srcEnd = 0;
   private srcOwned = false;
   private i = 0;
   private flushStart = 0;
 
-  /** Set by an async resolver that returned a thenable. The scan loops unwind
-   *  without advancing, leaving every field exactly where `resume()` needs it. */
-  protected suspended = false;
+  private readonly out: Emitter;
 
-  protected readonly out: Emitter;
-
-  // Re-scan queue. A reused scratch: live bytes are queue[0..queueLen). The
-  // payload it replays spans earlier chunks, so it cannot be re-read in place.
+  // Re-scan queue, live bytes are queue[0..queueLen).
   private inQueue = false;
   private queue = EMPTY;
   private queueLen = 0;
-  // The chunk cursor, parked while the queue is scanned. Fields, not locals: an
-  // async resolver can suspend mid-queue and unwind the stack.
+  // The chunk cursor, parked while the queue is scanned.
   private chunkI = 0;
   private chunkFlushStart = 0;
-  /** abortToken() re-entered the queue, so the cursor must not advance. */
+  /** An abort re-entered the queue, so the cursor must not advance. */
   private restarted = false;
 
-  constructor(options: TokenTransformOptions) {
+  // Ordered output queue.
+  private slots: Slot[] = [];
+  /** Slots still pending or streaming. */
+  private live = 0;
+  private held = 0;
+
+  /** Inside transform, resume or flush, until its result settles. */
+  private active = false;
+  private waiter: Waiter | undefined;
+  private flushing = false;
+  private finished = false;
+  private stopped = false;
+  private stopReason: unknown;
+
+  constructor(
+    options: TokenTransformOptions,
+    onClose: (failure?: { reason: unknown }) => void = noop,
+  ) {
     const compiled = compileOptions(options);
     this.openBytes = compiled.openBytes;
     this.closeBytes = compiled.closeBytes;
     this.openFirst = compiled.openBytes[0];
     this.closeFirst = compiled.closeBytes[0];
     this.resolve = compiled.resolve;
+    this.borrows = compiled.borrows;
+    this.concurrency = compiled.concurrency;
     this.validate = compiled.validate;
     this.onResolveError = compiled.onResolveError;
     this.onDone = compiled.onDone;
+    this.onClose = onClose;
     this.maxPayloadBytes = compiled.maxPayloadBytes;
+    // Twice the cap without a validator, so compaction stays amortized.
+    this.scratchLimit =
+      compiled.validate === undefined ? compiled.maxPayloadBytes * 2 : compiled.maxPayloadBytes;
     this.out = new Emitter(compiled.flushBytes);
     this.openM = new DelimiterMatcher(compiled.openBytes);
     this.closeM = new DelimiterMatcher(compiled.closeBytes);
+    this.openScan =
+      compiled.validate === undefined ? new DelimiterMatcher(compiled.openBytes) : undefined;
     this.stats =
       compiled.onDone === undefined
         ? undefined
@@ -112,44 +203,229 @@ export class Substituter {
     this.payload = new Uint8Array(Math.min(compiled.maxPayloadBytes, 64));
   }
 
-  transform(chunk: Uint8Array, ctrl: Controller): void {
+  transform(chunk: Uint8Array, ctrl: Controller): void | Promise<void> {
+    if (this.stopped) return Promise.reject(this.stopReason);
+    if (this.flushing) return Promise.reject(new TypeError("transformer is no longer active"));
     try {
-      this.begin(chunk, ctrl);
-      this.pump();
+      if (!(chunk instanceof Uint8Array)) throw new TypeError("chunk must be a Uint8Array");
+      this.chunk = chunk;
+      this.out.ctrl = ctrl;
+      this.enter(chunk, chunk.length, false, 0, 0);
+      this.scanning = true;
+      if (this.stats !== undefined) this.stats.bytesIn += chunk.length;
+      return this.run();
     } catch (error) {
-      this.reset();
-      throw error;
+      return this.failed(error);
     }
   }
 
-  /** Accept a chunk and position the scanner at its first byte. */
-  protected begin(chunk: Uint8Array, ctrl: Controller): void {
-    if (!(chunk instanceof Uint8Array)) throw new TypeError("chunk must be a Uint8Array");
-
-    this.chunk = chunk;
-    this.out.ctrl = ctrl;
-    this.enter(chunk, chunk.length, false, 0, 0);
-    if (this.stats !== undefined) this.stats.bytesIn += chunk.length;
-  }
-
-  /** Scan the current chunk to its end, or until an async resolver suspends.
-   *  Re-entrant: every exit point leaves the fields ready for the next call. */
-  protected pump(): void {
-    this.paused = false;
-    this.scan();
-    if (this.suspended || this.paused) return;
-    this.park();
-    // Must precede dropping the chunk: buffered spans are views into it.
-    this.out.flush();
-    this.out.ctrl = undefined;
-    this.chunk = EMPTY;
-    this.src = EMPTY;
-  }
-
-  resumeOutput(ctrl: Controller): void {
+  resume(ctrl: Controller): void | Promise<void> {
+    if (this.stopped) return Promise.reject(this.stopReason);
     if (!this.paused) return;
     this.out.ctrl = ctrl;
-    this.pump();
+    try {
+      return this.run();
+    } catch (error) {
+      return this.failed(error);
+    }
+  }
+
+  flush(ctrl: Controller): void | Promise<void> {
+    if (this.stopped) throw this.stopReason;
+    this.out.ctrl = ctrl;
+    try {
+      if (this.state === IN_TOKEN) {
+        this.emit(this.openBytes);
+        if (this.payloadEnd > this.base) this.emit(this.payloadCopy());
+        if (this.closeM.k > 0) this.emit(this.closeBytes.slice(0, this.closeM.k));
+      } else if (this.openM.k > 0) {
+        this.emit(this.openBytes.slice(0, this.openM.k));
+      }
+      this.endToken();
+      this.flushing = true;
+      return this.run();
+    } catch (error) {
+      this.fail(error);
+      throw this.stopReason;
+    }
+  }
+
+  cancel(reason: unknown = new Error("transformer cancelled")): void {
+    this.fail(reason);
+  }
+
+  private run(): void | Promise<void> {
+    this.active = true;
+    this.advance();
+    if (this.stopped) throw this.stopReason;
+    if (this.ready()) {
+      this.idle();
+      return;
+    }
+    this.out.flushInitial();
+    return new Promise<void>((resolve, reject) => {
+      this.waiter = { resolve, reject };
+    });
+  }
+
+  private failed(error: unknown): Promise<never> {
+    this.fail(error);
+    return Promise.reject(this.stopReason);
+  }
+
+  /** Drain, scan, and finish a flush once everything is out. */
+  private advance(): void {
+    this.progress();
+    // Background wakes keep `paused`: the host still owes a resume.
+    if (this.active) {
+      this.paused = this.out.blocked && (this.scanning || this.headReady()) && !this.stopped;
+    }
+    if (this.flushing && !this.finished && !this.stopped && this.slots.length === 0) {
+      this.finish();
+    }
+  }
+
+  private progress(): void {
+    for (;;) {
+      this.drain();
+      if (this.stopped || !this.active || !this.scanning || this.halted()) return;
+      if (!this.scan()) continue;
+      this.park();
+      // Must precede dropping the chunk: buffered spans are views into it.
+      if (this.slots.length === 0) this.out.flush();
+      this.scanning = false;
+      this.chunk = EMPTY;
+      this.src = EMPTY;
+    }
+  }
+
+  private ready(): boolean {
+    if (this.paused || this.finished) return true;
+    if (this.flushing) return false;
+    return !this.scanning && !(this.slots.length > 0 && this.full());
+  }
+
+  /** The current call settled. Only a pending queue keeps the controller. */
+  private idle(): void {
+    this.active = false;
+    this.out.flush();
+    if (this.slots.length === 0 && !this.scanning) this.out.ctrl = undefined;
+  }
+
+  /** A slot settled or a stream piece arrived. */
+  private wake(): void {
+    if (this.stopped || this.finished) return;
+    try {
+      this.advance();
+      if (this.stopped) return;
+      if (this.waiter === undefined) {
+        if (!this.active) this.idle();
+        return;
+      }
+      if (!this.ready()) return;
+      const waiter = this.waiter;
+      this.waiter = undefined;
+      this.idle();
+      waiter.resolve();
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  private finish(): void {
+    this.finished = true;
+    try {
+      this.out.flush();
+    } finally {
+      if (this.stats !== undefined) this.stats.bytesOut = this.out.bytesOut;
+      this.reset();
+      // No error here: its stack trace would retain this scanner.
+      this.onClose();
+    }
+    if (this.stats !== undefined) this.onDone?.(this.stats);
+  }
+
+  private fail(reason: unknown): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.stopReason = reason;
+    this.reset();
+    this.onClose({ reason });
+    const waiter = this.waiter;
+    this.waiter = undefined;
+    waiter?.reject(reason);
+  }
+
+  private halted(): boolean {
+    return this.out.blocked || (this.slots.length > 0 && this.full());
+  }
+
+  private full(): boolean {
+    return this.live >= this.concurrency || this.held > HELD_LIMIT;
+  }
+
+  private headReady(): boolean {
+    const head = this.slots[0];
+    return head !== undefined && head.value !== undefined && !head.reading;
+  }
+
+  /** Emit settled slots at the head of the queue, in order. */
+  private drain(): void {
+    const slots = this.slots;
+    while (slots.length > 0 && !this.stopped) {
+      const slot = slots[0];
+      const value = slot.value;
+      if (value === undefined || slot.reading || this.out.blocked) return;
+      if (!(value instanceof Uint8Array)) {
+        this.pull(slot, value);
+        return;
+      }
+      if (slot.verbatim) this.out.emit(this.openBytes);
+      this.out.emit(value);
+      if (slot.verbatim) this.out.emit(this.closeBytes);
+      const after = slot.after;
+      for (let p = 0; p < after.length && !this.stopped; p++) this.out.emit(after[p]);
+      this.held -= slot.held;
+      slot.owner = undefined;
+      slots.shift();
+    }
+  }
+
+  /** Read one piece of the head stream. */
+  private pull(slot: Slot, iter: AsyncIterator<Uint8Array>): void {
+    slot.reading = true;
+    Promise.prototype.then.call(
+      Promise.resolve(iter.next()),
+      (result: IteratorResult<Uint8Array>) => slot.owner?.piece(slot, result),
+      (error: unknown) => slot.owner?.fail(error),
+    );
+  }
+
+  private piece(slot: Slot, result: IteratorResult<Uint8Array>): void {
+    slot.reading = false;
+    try {
+      if (result.done) {
+        slot.value = EMPTY;
+        this.live--;
+      } else if (result.value instanceof Uint8Array) this.out.emit(result.value);
+      else throw new TypeError("replacement stream must yield Uint8Array chunks");
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    this.wake();
+  }
+
+  /** Route output behind the last slot, or straight out. */
+  private emit(part: Uint8Array): void {
+    const n = this.slots.length;
+    if (n === 0) this.out.emit(part);
+    else if (part.length > 0) {
+      const slot = this.slots[n - 1];
+      slot.after.push(part);
+      slot.held += part.length;
+      this.held += part.length;
+    }
   }
 
   private enter(
@@ -166,9 +442,8 @@ export class Substituter {
     this.flushStart = flushStart;
   }
 
-  /** Scan the current buffer, descending into the re-scan queue whenever an
-   *  abort fills it and coming back out where it left off. */
-  private scan(): void {
+  /** True at the end of the chunk, false on a halt. */
+  private scan(): boolean {
     for (;;) {
       // Re-read per iteration: an abort inside the queue replaces the buffer.
       while (this.i < this.srcEnd) {
@@ -176,9 +451,7 @@ export class Substituter {
         const end = this.srcEnd;
 
         if (this.state === OUTSIDE) {
-          // k === 0 means no held state, so a delimiter contained in this
-          // buffer can be settled by indexOf plus a direct compare. Only one
-          // straddling the end needs the matcher.
+          // No held state: a contained delimiter settles by indexOf and compare.
           if (this.openM.k === 0) {
             const open = this.openBytes;
             const len = open.length;
@@ -222,7 +495,7 @@ export class Substituter {
             if (this.i >= end) break;
             if (matched) {
               this.i++;
-              if (this.pauseOutput()) return;
+              if (this.halted()) return false;
               continue;
             }
           }
@@ -230,9 +503,9 @@ export class Substituter {
           // No validator: bulk-copy up to the next possible closePat start.
           const j = this.findClose(src, this.i, end);
           if (j > this.i) {
-            this.ensureScratch(this.payloadLen + (j - this.i));
-            copyBytes(this.payload, this.payloadLen, src, this.i, j);
-            this.payloadLen += j - this.i;
+            this.ensureScratch(j - this.i);
+            copyBytes(this.payload, this.payloadEnd, src, this.i, j);
+            this.payloadEnd += j - this.i;
             this.i = j;
           }
           if (this.i >= end) continue;
@@ -245,33 +518,26 @@ export class Substituter {
             if (m === len) {
               this.i += len - 1;
               this.finishToken();
-              if (this.suspended) return;
               this.i++;
-              if (this.pauseOutput()) return;
+              if (this.halted()) return false;
               continue;
             }
           }
         }
 
         this.step(src[this.i]);
-        if (this.suspended) return;
         if (this.restarted) {
           this.restarted = false;
-          if (this.pauseOutput()) return;
+          if (this.halted()) return false;
           continue;
         }
         this.i++;
-        if (this.pauseOutput()) return;
+        if (this.halted()) return false;
       }
 
-      if (!this.inQueue) return;
+      if (!this.inQueue) return true;
       this.leaveQueue();
     }
-  }
-
-  private pauseOutput(): boolean {
-    this.paused = this.out.blocked;
-    return this.paused;
   }
 
   /** Park the chunk cursor and scan the queue in its place. */
@@ -286,12 +552,11 @@ export class Substituter {
     this.park();
     this.inQueue = false;
     this.queueLen = 0;
-    // The byte that filled the queue is consumed; carry on past it.
+    // The byte that filled the queue is consumed. Carry on past it.
     this.enter(this.chunk, this.chunk.length, false, this.chunkI + 1, this.chunkFlushStart);
   }
 
-  /** End of a buffer: emit the settled span. Candidacy bytes still inside it
-   *  become virtual. */
+  /** End of a buffer: emit the settled span. Held candidates become virtual. */
   private park(): void {
     if (this.state !== OUTSIDE) return;
     // IN_TOKEN: in-token bytes are never part of a pending span.
@@ -304,27 +569,7 @@ export class Substituter {
     }
   }
 
-  flush(ctrl: Controller): void {
-    this.out.ctrl = ctrl;
-    try {
-      if (this.state === IN_TOKEN) {
-        this.out.emit(this.openBytes);
-        if (this.payloadLen > 0) this.out.emit(this.payload.slice(0, this.payloadLen));
-        if (this.closeM.k > 0) this.out.emit(this.closeBytes.slice(0, this.closeM.k));
-      } else if (this.openM.k > 0) {
-        this.out.emit(this.openBytes.slice(0, this.openM.k));
-      }
-      this.out.flush();
-    } finally {
-      this.reset();
-    }
-    if (this.stats !== undefined) {
-      this.stats.bytesOut = this.out.bytesOut;
-      (this.onDone as (s: TokenStats) => void)(this.stats);
-    }
-  }
-
-  /** Per-byte automaton. The semantic model; the loops above are its fast paths. */
+  /** Per-byte automaton. The semantic model. The loops above are its fast paths. */
   private step(byte: number): void {
     if (this.state === OUTSIDE) {
       const res = this.openM.feed(byte);
@@ -369,86 +614,226 @@ export class Substituter {
     this.flushStart = this.i + 1;
     this.carry = 0;
     this.state = IN_TOKEN;
-    this.payloadLen = 0;
+    this.clearPayload();
     this.closeM.reset();
   }
 
-  /** A complete token. The resolver call is the only suspend point: when it
-   *  parks, every field still describes the token, and `resume()` finishes it. */
+  /** A complete token. The resolver runs now, its result may settle later. */
   private finishToken(): void {
-    const value = this.invokeResolve();
-    if (this.suspended) return;
-    this.completeToken(value);
-  }
-
-  /** Sync resolution. Overridden by the async subclass. */
-  protected invokeResolve(): Uint8Array | null {
-    try {
-      return (this.resolve as (p: Uint8Array) => Uint8Array | null)(
-        this.payloadView(this.payloadLen),
-      );
-    } catch (error) {
-      if (this.onResolveError === undefined) throw error;
-      return this.onResolveError(error, this.payloadCopy());
-    }
-  }
-
-  /** Emit a resolved token and leave the scanner outside it. */
-  protected completeToken(value: Uint8Array | null): void {
     this.flushStart = this.i + 1;
-
-    if (value === null) {
-      // Null is atomic: verbatim, and the span is not re-scanned.
-      this.out.emit(this.openBytes);
-      if (this.payloadLen > 0) this.out.emit(this.payload.slice(0, this.payloadLen));
-      this.out.emit(this.closeBytes);
-      if (this.stats !== undefined) this.stats.rejected++;
-    } else {
-      if (value.length > 0) this.out.emit(value);
-      if (this.stats !== undefined) this.stats.resolved++;
+    const copy = this.borrows ? undefined : this.payloadCopy();
+    let value: unknown;
+    let promise: Promise<unknown> | undefined;
+    let recovered = false;
+    try {
+      value = this.resolve(copy ?? this.payloadScratch());
+      promise = toPromise(value);
+    } catch (error) {
+      if (this.stopped) throw this.stopReason;
+      if (this.onResolveError === undefined) throw error;
+      recovered = true;
+      value = this.onResolveError(error, copy ?? this.payloadCopy());
+      promise = toPromise(value);
     }
+    if (this.stopped) {
+      quiet(promise);
+      if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value));
+      throw this.stopReason;
+    }
+    if (promise !== undefined) {
+      const slot = this.addSlot(undefined, copy ?? this.payloadCopy());
+      slot.recovered = recovered;
+      this.watch(slot, promise);
+      this.out.flushInitial();
+    } else this.place(value);
     this.endToken();
   }
 
-  /** Finish a token whose resolver parked, then carry on scanning. The byte that
-   *  completed the token has not been consumed yet, which is why this advances
-   *  the cursor the suspended loop was about to advance. */
-  protected resume(value: Uint8Array | null): void {
-    this.suspended = false;
-    this.completeToken(value);
-    this.i++;
-    this.pump();
+  /** A synchronous replacement. */
+  private place(value: unknown): void {
+    if (value === null) {
+      // Null is atomic: verbatim, and the span is not re-scanned.
+      this.emit(this.openBytes);
+      if (this.payloadEnd > this.base) this.emit(this.payloadCopy());
+      this.emit(this.closeBytes);
+      if (this.stats !== undefined) this.stats.rejected++;
+      return;
+    }
+    if (value instanceof Uint8Array) {
+      if (value.length > 0) this.emit(value);
+    } else if (typeof value === "string") {
+      if (value.length > 0) this.emit(encodeText(value, "resolve result"));
+    } else {
+      const iter = iteratorOf(value);
+      if (iter === undefined) throw invalid(value);
+      this.addSlot(iter, EMPTY);
+    }
+    if (this.stats !== undefined) this.stats.resolved++;
+  }
+
+  private addSlot(value: AsyncIterator<Uint8Array> | undefined, payload: Uint8Array): Slot {
+    const slot: Slot = {
+      owner: this,
+      value,
+      verbatim: false,
+      payload,
+      reading: false,
+      recovered: false,
+      after: [],
+      held: 0,
+    };
+    this.slots.push(slot);
+    this.live++;
+    return slot;
+  }
+
+  private watch(slot: Slot, promise: Promise<unknown>): void {
+    Promise.prototype.then.call(
+      promise,
+      (value: unknown) => {
+        const owner = slot.owner;
+        if (owner !== undefined) owner.settle(slot, value);
+        else if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value));
+      },
+      (error: unknown) => slot.owner?.rejectSlot(slot, error),
+    );
+  }
+
+  private settle(slot: Slot, value: unknown): void {
+    let bytes: Uint8Array | undefined;
+    try {
+      if (value === null) {
+        slot.verbatim = true;
+        bytes = slot.payload;
+      } else if (value instanceof Uint8Array) bytes = value;
+      else if (typeof value === "string") bytes = encodeText(value, "resolve result");
+      else {
+        const iter = iteratorOf(value);
+        if (iter === undefined) throw invalid(value);
+        slot.value = iter;
+      }
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    if (bytes !== undefined) {
+      slot.value = bytes;
+      const size = slot.verbatim
+        ? this.openBytes.length + bytes.length + this.closeBytes.length
+        : bytes.length;
+      this.live--;
+      slot.held += size;
+      this.held += size;
+    }
+    slot.payload = EMPTY;
+    if (this.stats !== undefined) {
+      if (slot.verbatim) this.stats.rejected++;
+      else this.stats.resolved++;
+    }
+    this.wake();
+  }
+
+  private rejectSlot(slot: Slot, error: unknown): void {
+    if (this.onResolveError === undefined || slot.recovered) {
+      this.fail(error);
+      return;
+    }
+    slot.recovered = true;
+    let value: unknown;
+    let promise: Promise<unknown> | undefined;
+    try {
+      value = this.onResolveError(error, slot.payload);
+      promise = toPromise(value);
+    } catch (failure) {
+      this.fail(failure);
+      return;
+    }
+    if (this.stopped) quiet(promise);
+    else if (promise !== undefined) this.watch(slot, promise);
+    else this.settle(slot, value);
   }
 
   /** A retainable copy of the committed payload. */
-  protected payloadCopy(): Uint8Array {
-    return this.payload.slice(0, this.payloadLen);
+  private payloadCopy(): Uint8Array {
+    return this.payload.slice(this.base, this.payloadEnd);
   }
 
-  /**
-   * Abort: emit `open` verbatim, then re-scan the committed payload plus
-   * every byte that followed it. `tail` is closeBytes[from..released), then the
-   * still-held closeBytes[0..heldK), then `trailing` if >= 0.
-   *
-   * The queue scratch is reused: the unconsumed old suffix moves first
-   * (copyWithin is a memmove), then the head is overwritten.
-   */
-  private abortToken(from: number, released: number, heldK: number, trailing: number): void {
-    this.flushStart = this.i + 1;
-    this.out.emit(this.openBytes);
-    if (this.stats !== undefined) this.stats.aborted++;
+  /** Scratch view for a borrowing resolver, valid only during the call. */
+  private payloadScratch(): Uint8Array {
+    return this.base === 0
+      ? this.payloadView(this.payloadEnd)
+      : this.payload.subarray(this.base, this.payloadEnd);
+  }
 
+  private abortToken(from: number, released: number, heldK: number, trailing: number): void {
+    if (this.openScan !== undefined) {
+      this.capAbort(this.openScan, from, released, heldK, trailing);
+      return;
+    }
+    // Validator: emit `open` verbatim, then re-scan the payload and the tail.
+    this.flushStart = this.i + 1;
+    this.emit(this.openBytes);
+    if (this.stats !== undefined) this.stats.aborted++;
+    this.requeueTail(this.payload, this.base, this.payloadEnd, from, released, heldK, trailing);
+    this.endToken();
+  }
+
+  /** Linear cap abort: restart the payload at the next open inside it. */
+  private capAbort(
+    openScan: DelimiterMatcher,
+    from: number,
+    released: number,
+    heldK: number,
+    trailing: number,
+  ): void {
+    this.flushStart = this.i + 1;
+    const open = this.openBytes;
+    const payload = this.payload;
+    for (let p = this.scanned; p < this.payloadEnd; p++) {
+      if (openScan.feed(payload[p]) === COMPLETE) this.opens.push(p + 1 - open.length);
+    }
+    this.scanned = this.payloadEnd;
+    const opens = this.opens;
+    for (;;) {
+      this.emit(open);
+      if (this.stats !== undefined) this.stats.aborted++;
+      while (this.openHead < opens.length && opens[this.openHead] < this.base) this.openHead++;
+      if (this.openHead === opens.length) break;
+      const at = opens[this.openHead++];
+      if (at > this.base) this.emit(payload.slice(this.base, at));
+      this.base = at + open.length;
+      if (this.payloadEnd - this.base <= this.maxPayloadBytes) {
+        this.closeM.reset();
+        this.requeueTail(EMPTY, 0, 0, from, released, heldK, trailing);
+        return;
+      }
+    }
+    // No open inside. A trailing open candidate is re-scanned with the tail.
+    const keep = Math.min(openScan.k, this.payloadEnd - this.base);
+    const cut = this.payloadEnd - keep;
+    if (cut > this.base) this.emit(payload.slice(this.base, cut));
+    this.requeueTail(payload, cut, this.payloadEnd, from, released, heldK, trailing);
+    this.endToken();
+  }
+
+  /** Re-scan src[start..end) and the held close tail before unconsumed input. */
+  private requeueTail(
+    src: Uint8Array,
+    start: number,
+    end: number,
+    from: number,
+    released: number,
+    heldK: number,
+    trailing: number,
+  ): void {
     const rest = this.inQueue ? this.queueLen - this.i - 1 : 0;
     const restStart = this.i + 1;
-    const tailLen = released - from + heldK + (trailing >= 0 ? 1 : 0);
-    const head = this.payloadLen + tailLen;
+    const head = end - start + released - from + heldK + (trailing >= 0 ? 1 : 0);
     const q = (this.queue = requeue(this.queue, head, rest, restStart, 0));
-    let w = copyBytes(q, 0, this.payload, 0, this.payloadLen);
+    let w = copyBytes(q, 0, src, start, end);
     for (let pos = from; pos < released; pos++) q[w++] = this.closeBytes[pos];
     for (let pos = 0; pos < heldK; pos++) q[w++] = this.closeBytes[pos];
     if (trailing >= 0) q[w++] = trailing;
-
-    this.endToken();
     this.queueLen = head + rest;
     // Already inside the queue means the buffer was just replaced: restart on it.
     if (this.inQueue) this.enter(this.queue, this.queueLen, true, 0, 0);
@@ -456,13 +841,9 @@ export class Substituter {
     this.restarted = true;
   }
 
-  /** First closeFirst in src[from..end), clamped to the cap: bytes past `room`
-   *  cannot be committed, so whether closeFirst occurs among them is irrelevant,
-   *  and an unbounded indexOf would rescan the rest of src on every cap abort.
-   *  Returns the clamp position when absent; the caller commits src[from..j)
-   *  whole, so a cap overflow still aborts on the exact same byte. */
+  /** First closeFirst in src[from..end), clamped to the cap so aborts stay linear. */
   private findClose(src: Uint8Array<ArrayBufferLike>, from: number, end: number): number {
-    const room = this.maxPayloadBytes - this.payloadLen;
+    const room = this.maxPayloadBytes - (this.payloadEnd - this.base);
     const limit = room < end - from ? from + room : end;
     if (limit - from <= 512) {
       let j = from;
@@ -475,16 +856,15 @@ export class Substituter {
   }
 
   private tryCommit(byte: number): boolean {
-    if (this.validate !== undefined && !this.validate(this.payloadView(this.payloadLen), byte))
+    if (this.validate !== undefined && !this.validate(this.payloadView(this.payloadEnd), byte))
       return false;
-    if (this.payloadLen + 1 > this.maxPayloadBytes) return false;
-    this.ensureScratch(this.payloadLen + 1);
-    this.payload[this.payloadLen++] = byte;
+    if (this.payloadEnd - this.base + 1 > this.maxPayloadBytes) return false;
+    this.ensureScratch(1);
+    this.payload[this.payloadEnd++] = byte;
     return true;
   }
 
-  /** Scratch view handed to validate/resolve. Valid only during the call, which
-   *  is what makes reusing one view object per length safe. */
+  /** Scratch view for validate, valid only during the call. */
   private payloadView(len: number): Uint8Array {
     if (len >= VIEW_CACHE_MAX) return this.payload.subarray(0, len);
     const cached = this.payloadViews[len];
@@ -494,55 +874,87 @@ export class Substituter {
     return view;
   }
 
-  private ensureScratch(need: number): void {
-    if (need <= this.payload.length) return;
+  /** Room for `extra` more bytes. Compacts once base passes half the scratch. */
+  private ensureScratch(extra: number): void {
+    if (this.payloadEnd + extra <= this.payload.length) return;
+    if (this.base > 0 && this.base >= this.payload.length >> 1) {
+      this.shift(this.payload);
+      if (this.payloadEnd + extra <= this.payload.length) return;
+    }
     let size = this.payload.length === 0 ? 16 : this.payload.length * 2;
+    const need = this.payloadEnd - this.base + extra;
     if (size < need) size = need;
-    if (size > this.maxPayloadBytes) size = this.maxPayloadBytes;
-    const next = new Uint8Array(size);
-    next.set(this.payload.subarray(0, this.payloadLen));
-    this.payload = next;
+    if (size > this.scratchLimit) size = this.scratchLimit;
+    this.shift(new Uint8Array(size));
     this.payloadViews.length = 0;
   }
 
-  /** Emit held open bytes that no longer belong to a candidacy, oldest first.
-   *  Only the virtual ones: the rest are still inside the pending span. */
+  /** Move the live payload to the start of `into`. */
+  private shift(into: Uint8Array): void {
+    const base = this.base;
+    if (into === this.payload) into.copyWithin(0, base, this.payloadEnd);
+    else into.set(this.payload.subarray(base, this.payloadEnd));
+    this.payload = into;
+    this.payloadEnd -= base;
+    this.scanned = this.scanned > base ? this.scanned - base : 0;
+    this.base = 0;
+    const opens = this.opens;
+    let w = 0;
+    for (let r = this.openHead; r < opens.length; r++) {
+      if (opens[r] >= base) opens[w++] = opens[r] - base;
+    }
+    opens.length = w;
+    this.openHead = 0;
+  }
+
+  /** Emit held open bytes that left the candidacy, oldest first. */
   private releaseOpen(released: number): void {
     const count = released < this.carry ? released : this.carry;
     if (count === 0) return;
-    this.out.emit(this.openBytes.subarray(0, count));
+    this.emit(this.openBytes.subarray(0, count));
     this.carry -= count;
   }
 
-  /** A buffer the scanner reuses is copied out of; a caller's chunk is enqueued
-   *  by reference. */
+  /** Reused buffers are copied out, caller chunks go out by reference. */
   private flushSpan(end: number): void {
     if (end > this.flushStart) {
       const src = this.src;
-      if (this.srcOwned) this.out.emit(src.slice(this.flushStart, end));
-      else this.out.emitRange(src, this.flushStart, end);
+      if (this.srcOwned) this.emit(src.slice(this.flushStart, end));
+      else if (this.slots.length === 0) this.out.emitRange(src, this.flushStart, end);
+      else this.emit(src.subarray(this.flushStart, end));
       this.flushStart = end;
     }
   }
 
+  private clearPayload(): void {
+    this.base = 0;
+    this.payloadEnd = 0;
+    this.scanned = 0;
+    this.opens.length = 0;
+    this.openHead = 0;
+    this.openScan?.reset();
+  }
+
   private endToken(): void {
     this.state = OUTSIDE;
-    this.payloadLen = 0;
+    this.clearPayload();
     this.closeM.reset();
     this.openM.reset();
     this.carry = 0;
   }
 
-  cancel(): void {
-    this.reset();
-  }
-
-  protected reset(): void {
+  private reset(): void {
+    for (const slot of this.slots) releaseSlot(slot);
+    this.slots = [];
+    this.live = 0;
+    this.held = 0;
     this.paused = false;
+    this.active = false;
+    this.scanning = false;
     this.endToken();
-    this.suspended = false;
     this.payload = EMPTY;
     this.payloadViews.length = 0;
+    this.opens = [];
     this.chunk = EMPTY;
     this.src = EMPTY;
     this.srcEnd = 0;
@@ -556,57 +968,44 @@ export class Substituter {
   }
 }
 
-/** Single-use transformer body, for runtimes where `TransformStream` is not a
- *  global: `new TransformStream(createTokenTransformer(options))`. Construct one
- *  per stream. Touches no global other than `TextEncoder`, and only then if a
- *  delimiter is a string. */
+/** Body for `new TransformStream(...)`. Single use. No backpressure inside a
+ *  chunk: every replacement for a chunk is enqueued before the next read. */
 export function createTokenTransformer(options: TokenTransformOptions): TokenTransformer {
-  let s: Substituter | undefined = new Substituter(options);
-  const body = {
+  let signal = options?.signal;
+  checkSignal(signal);
+  let s: Substituter | undefined;
+  let failure: { reason: unknown } | undefined;
+  const onClose = (closed?: { reason: unknown }) => {
+    failure = closed;
+    s = undefined;
+    signal?.removeEventListener("abort", onAbort);
+    signal = undefined;
+  };
+  const onAbort = () => s?.cancel(signal?.reason);
+  const inactive = () =>
+    failure === undefined ? new TypeError("transformer is no longer active") : failure.reason;
+  s = new Substituter(options, onClose);
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const body: TokenTransformer & FlowBody = {
     get paused() {
       return s?.paused ?? false;
     },
-    resume: (ctrl: Controller) => {
-      try {
-        s?.resumeOutput(ctrl);
-      } catch (error) {
-        s?.cancel();
-        s = undefined;
-        throw error;
-      }
-    },
-    transform: (chunk: Uint8Array, ctrl: Controller) => {
-      if (s === undefined) throw new TypeError("transformer is no longer active");
-      try {
-        s.transform(chunk, ctrl);
-      } catch (error) {
-        s = undefined;
-        throw error;
-      }
-    },
+    resume: (ctrl: Controller) => (s === undefined ? Promise.reject(inactive()) : s.resume(ctrl)),
+    transform: (chunk: Uint8Array, ctrl: Controller) =>
+      s === undefined ? Promise.reject(inactive()) : s.transform(chunk, ctrl),
     flush: (ctrl: Controller) => {
-      const active = s;
-      s = undefined;
-      active?.flush(ctrl);
+      if (s === undefined) throw inactive();
+      return s.flush(ctrl);
     },
-    cancel: () => {
-      s?.cancel();
-      s = undefined;
-    },
+    cancel: (reason?: unknown) => s?.cancel(reason),
   };
   return body;
 }
 
-/** Single-use native transform. */
-export function createTokenTransformStream(
-  options: TokenTransformOptions,
-): TransformStream<Uint8Array, Uint8Array> {
-  return new TransformStream<Uint8Array, Uint8Array>(createTokenTransformer(options));
-}
-
-/** Single-use pair with intra-chunk backpressure. */
-export function createTokenStreamPair(
+/** Backpressured pair for `pipeThrough`. Single use. */
+export function createTokenStream(
   options: TokenTransformOptions,
 ): ReadableWritablePair<Uint8Array, Uint8Array> {
-  return flowStream(createTokenTransformer(options));
+  return flowStream(createTokenTransformer(options), options?.signal);
 }

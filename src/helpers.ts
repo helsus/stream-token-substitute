@@ -1,13 +1,21 @@
-import { createTokenTransformStream } from "./transformer.ts";
-import type { TokenResolver, TokenTransformOptions } from "./types.ts";
+import { createTokenStream } from "./transformer.ts";
+import { BORROWING, type TokenResolver, type TokenTransformOptions } from "./types.ts";
 
-/** These describe the upstream body, which substitution has just changed. */
-const STALE_HEADERS = ["content-length", "etag", "digest", "content-digest"];
+/** Headers describing the upstream bytes, which substitution changes. */
+const STALE_HEADERS = [
+  "content-length",
+  "content-encoding",
+  "etag",
+  "digest",
+  "content-digest",
+  "repr-digest",
+  "content-md5",
+  "accept-ranges",
+];
 
 let encoder: TextEncoder | undefined;
 
-/** Lazy for the same reason the delimiter encoder is: nothing is constructed at
- *  import time, so this module stays importable where TextEncoder is not global. */
+/** Lazy, so importing needs no global TextEncoder. */
 function encode(value: string): Uint8Array {
   if (encoder === undefined) {
     if (typeof TextEncoder === "undefined") {
@@ -71,7 +79,7 @@ export function resolveFrom(
     byLength.set(length, byHash);
   }
 
-  return (payload) => {
+  const resolver: TokenResolver = (payload) => {
     const bucket = byLength.get(payload.length);
     if (bucket === undefined) return null;
     const candidates = bucket instanceof Map ? bucket.get(hashBytes(payload)) : bucket;
@@ -84,26 +92,27 @@ export function resolveFrom(
     }
     return null;
   };
+  BORROWING.add(resolver);
+  return resolver;
 }
 
 /**
- * Pipe a response body through a substitution and drop the headers that no
- * longer describe it: `Content-Length`, `ETag`, `Digest`, `Content-Digest`.
- *
- * Accepts token options, native transforms, or stream pairs.
- *
- * A response with no body (204, HEAD) is returned untouched.
+ * Pipe a decoded response body (as `fetch()` yields it) through a substitution
+ * and drop headers that described the original bytes. Throws on partial content.
  */
 export function substituteResponse(
   response: Response,
   substitution: TokenTransformOptions | ReadableWritablePair<Uint8Array, Uint8Array>,
 ): Response {
   if (response.body === null) return response;
+  if (response.status === 206 || response.headers.has("content-range")) {
+    throw new TypeError("partial content cannot be rewritten: request the full representation");
+  }
 
   const transform =
     "readable" in substitution && "writable" in substitution
       ? substitution
-      : createTokenTransformStream(substitution);
+      : createTokenStream(substitution);
 
   const headers = new Headers(response.headers);
   for (const name of STALE_HEADERS) headers.delete(name);
