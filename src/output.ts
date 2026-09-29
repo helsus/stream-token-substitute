@@ -4,7 +4,7 @@ import type { OutputController } from "./flow.ts";
 /** Below this a memcpy is cheaper than an extra read and microtask. */
 const PASS_THROUGH_BYTES = 1024;
 
-/** Output accumulator that merges small pieces up to `flushBytes`. */
+/** @internal Output accumulator that merges small pieces up to `mergeBytes`. */
 export class Emitter {
   private controller: OutputController | undefined;
   bytesOut = 0;
@@ -12,14 +12,14 @@ export class Emitter {
   private readonly ranges: number[] = [];
   private len = 0;
   private started = false;
-  private readonly flushBytes: number;
+  private readonly mergeBytes: number;
   private limit = 0;
   private passThrough = 0;
   /** Only an enqueue can newly block, so a clear check stays valid until the next. */
   private recheck = true;
 
-  constructor(flushBytes: number) {
-    this.flushBytes = flushBytes;
+  constructor(mergeBytes: number) {
+    this.mergeBytes = mergeBytes;
     this.ctrl = undefined;
   }
 
@@ -30,7 +30,7 @@ export class Emitter {
   set ctrl(ctrl: OutputController | undefined) {
     this.controller = ctrl;
     this.recheck = true;
-    this.limit = Math.min(this.flushBytes, ctrl?.bufferLimit ?? this.flushBytes);
+    this.limit = Math.min(this.mergeBytes, ctrl?.bufferLimit ?? this.mergeBytes);
     this.passThrough = Math.min(PASS_THROUGH_BYTES, this.limit);
   }
 

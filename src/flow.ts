@@ -1,17 +1,20 @@
+/** @internal */
 export function checkSignal(signal: AbortSignal | undefined): void {
   if (signal !== undefined && !(signal instanceof AbortSignal)) {
     throw new TypeError("signal must be an AbortSignal");
   }
 }
 
+/** @internal */
 export type Controller = TransformStreamDefaultController<Uint8Array>;
 
-/** A controller that may report output backpressure. */
+/** @internal A controller that may report output backpressure. */
 export interface OutputController extends Controller {
   blocked?(): boolean;
   bufferLimit?: number;
 }
 
+/** @internal */
 export interface FlowBody {
   transform(chunk: Uint8Array, ctrl: OutputController): void | Promise<void>;
   flush(ctrl: OutputController): void | Promise<void>;
@@ -22,7 +25,7 @@ export interface FlowBody {
   poke?(): void;
 }
 
-/** A single-use scanner with its abort wiring. Once closed, calls fail with `inactive()`. */
+/** @internal A single-use scanner with its abort wiring. Once closed, calls fail with `inactive()`. */
 export class Session<S extends { cancel(reason?: unknown): void }> {
   scanner: S | undefined;
   #closed = false;
@@ -62,7 +65,7 @@ export class Session<S extends { cancel(reason?: unknown): void }> {
   }
 }
 
-/** Byte-budgeted output, with one atomic replacement of overshoot. */
+/** @internal Byte-budgeted output, with one atomic replacement of overshoot. */
 export function flowStream(
   body: FlowBody,
   signal?: AbortSignal,

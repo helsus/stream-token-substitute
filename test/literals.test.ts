@@ -146,14 +146,14 @@ describe("literals", () => {
       },
     };
     await one("ab", options);
-    expect(stats).toEqual({ substituted: 1, rejected: 1, bytesIn: 2, bytesOut: 3 });
+    expect(stats).toEqual({ replaced: 1, rejected: 1, bytesIn: 2, bytesOut: 3 });
   });
 
   it("rejects bad options", () => {
     expect(() => nativeLiteralStream({ literals: [] })).toThrow(TypeError);
     expect(() => nativeLiteralStream({ literals: [""] })).toThrow(TypeError);
     expect(() => nativeLiteralStream({ literals: ["a"] })).toThrow(/resolve is required/);
-    expect(() => nativeLiteralStream({ literals: { a: "b" }, flushBytes: -1 })).toThrow(RangeError);
+    expect(() => nativeLiteralStream({ literals: { a: "b" }, mergeBytes: -1 })).toThrow(RangeError);
   });
 
   it("refuses a literal set that would need too much memory to compile", () => {
@@ -191,10 +191,10 @@ describe("literals", () => {
     );
   });
 
-  it("enqueues one part per piece at flushBytes 0", async () => {
+  it("enqueues one part per piece at mergeBytes 0", async () => {
     const parts = await runLiteralParts([bytes("x__ID__y")], {
       literals: { __ID__: "!" },
-      flushBytes: 0,
+      mergeBytes: 0,
     });
     expect(parts.map((p) => decoder.decode(p))).toEqual(["x", "!", "y"]);
   });
@@ -259,13 +259,13 @@ describe("literals differential", () => {
         chunkings.push(Array.from({ length: input.length }, (_, k) => k).slice(1));
 
         for (const cuts of chunkings) {
-          for (const flushBytes of [16384, 0]) {
+          for (const mergeBytes of [16384, 0]) {
             const actual = concat(
-              await runLiteralParts(splitAt(input, cuts), { ...set.options, flushBytes }),
+              await runLiteralParts(splitAt(input, cuts), { ...set.options, mergeBytes }),
             );
             if (hex(actual) !== hex(expected)) {
               throw new Error(
-                `set=${set.name} seed=${SEED} round=${round} cuts=[${cuts}] flushBytes=${flushBytes}\n` +
+                `set=${set.name} seed=${SEED} round=${round} cuts=[${cuts}] mergeBytes=${mergeBytes}\n` +
                   `input:    ${hex(input)}\nexpected: ${hex(expected)}\nactual:   ${hex(actual)}`,
               );
             }
@@ -491,7 +491,7 @@ function runSync(
   const ctrl = {
     enqueue: (part: Uint8Array) => parts.push(part),
   } as unknown as TransformStreamDefaultController<Uint8Array>;
-  const s = new LiteralSubstituter(options);
+  const s = new LiteralSubstituter(options, () => {});
   let indexed = false;
   for (const chunk of splitAt(input, cuts)) {
     s.transform(chunk, ctrl);
@@ -559,26 +559,24 @@ describe("resolver returns", () => {
     for (const [value, kind] of [
       [undefined, "undefined"],
       [42, "number"],
-      [[1], "array"],
-      [new Uint16Array(1), "Uint16Array"],
-      [{}, "Object"],
+      [{}, "object"],
     ] as const) {
       const options = {
         literals: ["a"],
         resolve: () => value,
       } as unknown as LiteralTransformOptions;
       await expect(one("a", options)).rejects.toThrow(
-        `resolve must return Uint8Array, string, or null; got ${kind}`,
+        `resolve must return Uint8Array, string, null, a stream, or a promise of one; got ${kind}`,
       );
     }
   });
 
   it("copies a returned literal view held across a chunk boundary", async () => {
-    for (const flushBytes of [16384, 0]) {
+    for (const mergeBytes of [16384, 0]) {
       const options: LiteralTransformOptions = {
         literals: ["abcd", "cdx"],
         resolve: (literal) => literal.subarray(1),
-        flushBytes,
+        mergeBytes,
       };
       const input = bytes("..abcd..abcd.cdx.abcdabcd");
       const expected = decoder.decode(substituteLiterals(input, options));

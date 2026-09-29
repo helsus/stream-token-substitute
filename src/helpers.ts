@@ -1,5 +1,11 @@
 import { createTokenStream } from "./transformer.ts";
-import { BORROWING, type TokenResolver, type TokenTransformOptions } from "./types.ts";
+import {
+  BORROWING,
+  type Replacement,
+  type ResolveContext,
+  type TokenResolver,
+  type TokenTransformOptions,
+} from "./types.ts";
 
 /** Headers describing the upstream bytes, which substitution changes. */
 const STALE_HEADERS = [
@@ -92,6 +98,28 @@ export function resolveFrom(
     }
     return null;
   };
+  BORROWING.add(resolver);
+  return resolver;
+}
+
+let decoder: TextDecoder | undefined;
+
+/** Lazy, so importing needs no global TextDecoder. */
+function decode(bytes: Uint8Array): string {
+  if (decoder === undefined) {
+    if (typeof TextDecoder === "undefined") {
+      throw new TypeError("resolveName needs a global TextDecoder");
+    }
+    decoder = new TextDecoder();
+  }
+  return decoder.decode(bytes);
+}
+
+/** A resolver over the payload decoded as UTF-8. Invalid bytes become U+FFFD. */
+export function resolveName(
+  fn: (name: string, context: ResolveContext) => Replacement | PromiseLike<Replacement>,
+): TokenResolver {
+  const resolver: TokenResolver = (payload, context) => fn(decode(payload), context);
   BORROWING.add(resolver);
   return resolver;
 }

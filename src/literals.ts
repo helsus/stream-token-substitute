@@ -1,20 +1,29 @@
 import { AhoCorasick } from "./aho-corasick.ts";
 import { copyBytes, EMPTY, encodeText } from "./bytes.ts";
-import { type Controller, type FlowBody, flowStream, Session } from "./flow.ts";
-import { Emitter } from "./output.ts";
-import { isByteCount, optionalFunction, type TokenTransformer } from "./types.ts";
+import { flowStream } from "./flow.ts";
+import { Lookahead, lookaheadBody, toPromise } from "./lookahead.ts";
+import {
+  compileShared,
+  optionalFunction,
+  type Replacement,
+  type ResolveContext,
+  type ResolveErrorHandler,
+  type TokenTransformer,
+} from "./types.ts";
 
 /** Compile memory ceiling, sized for a 128 MiB Workers isolate. */
 export const DEFAULT_MAX_MEMORY_BYTES = 16 * 1024 * 1024;
 
-/** Replacement for a matched literal, or null to keep it. `literal` is valid only during the call, returning it is safe. */
-export type LiteralResolver = (literal: Uint8Array, index: number) => Uint8Array | string | null;
-
-type ByteResolver = (literal: Uint8Array, index: number) => Uint8Array | null;
+/** Replacement for a matched literal, same contract as `TokenResolver`. `literal` is a fresh copy. */
+export type LiteralResolver = (
+  literal: Uint8Array,
+  index: number,
+  context: ResolveContext,
+) => Replacement | PromiseLike<Replacement>;
 
 /** Counts for one stream, delivered once from `flush`. */
 export interface LiteralStats {
-  substituted: number;
+  replaced: number;
   rejected: number;
   bytesIn: number;
   bytesOut: number;
@@ -36,8 +45,12 @@ export interface LiteralTransformOptions extends CompileLiteralOptions {
   literals: LiteralSource | CompiledLiterals;
   /** Required when `literals` is an array. */
   resolve?: LiteralResolver;
-  /** Output merge threshold in bytes. Default 16384. */
-  flushBytes?: number;
+  /** Output merge threshold in bytes. `0` disables merging. Default 16384. */
+  mergeBytes?: number;
+  /** Pending lookups (thenables and unread streams) scanned ahead of output. Default 4. */
+  concurrency?: number;
+  /** Called when `resolve` throws or rejects. Absent: the error errors the stream. */
+  onResolveError?: ResolveErrorHandler;
   /** Stops the stream with the abort reason. */
   signal?: AbortSignal;
   onDone?: (stats: LiteralStats) => void;
@@ -45,15 +58,19 @@ export interface LiteralTransformOptions extends CompileLiteralOptions {
 
 export type LiteralTransformer = TokenTransformer;
 
-interface CompiledLiteralOptions {
+/** @internal */
+export interface CompiledLiteralOptions {
   set: LiteralSet;
-  resolve: ByteResolver;
-  flushBytes: number;
+  /** The replacement table, or the user resolver. */
+  resolve: Uint8Array[] | LiteralResolver;
+  mergeBytes: number;
+  concurrency: number;
+  onResolveError: ResolveErrorHandler | undefined;
   onDone: ((stats: LiteralStats) => void) | undefined;
 }
 
-/** The automaton plus the bytes it matches. */
-interface LiteralSet {
+/** @internal The automaton plus the bytes it matches. */
+export interface LiteralSet {
   readonly literals: Uint8Array[];
   readonly values: Uint8Array[] | undefined;
   readonly ac: AhoCorasick;
@@ -71,8 +88,7 @@ const compiledSets = new WeakMap<CompiledLiterals, LiteralSet>();
 class IndexedLiterals {
   private readonly literals: readonly Uint8Array[];
   private readonly ac: AhoCorasick;
-  private readonly resolve: ByteResolver;
-  private readonly out: Emitter;
+  private readonly owner: LiteralSubstituter;
   private readonly ring: Uint8Array;
   /** Per start position in the ring: longest literal index + 1, 0 for none. */
   private readonly matches: Uint32Array;
@@ -81,16 +97,10 @@ class IndexedLiterals {
   private plain = 0;
   private node = 0;
 
-  constructor(
-    literals: readonly Uint8Array[],
-    ac: AhoCorasick,
-    resolve: ByteResolver,
-    out: Emitter,
-  ) {
+  constructor(literals: readonly Uint8Array[], ac: AhoCorasick, owner: LiteralSubstituter) {
     this.literals = literals;
     this.ac = ac;
-    this.resolve = resolve;
-    this.out = out;
+    this.owner = owner;
     this.ring = new Uint8Array(ac.maxLength + 1);
     this.matches = new Uint32Array(this.ring.length);
   }
@@ -101,7 +111,7 @@ class IndexedLiterals {
     this.settle(false);
     for (let i = from; i < end; i++) {
       if (this.read - this.plain === this.ring.length) this.flushPlain();
-      if (this.out.blocked) return i;
+      if (this.owner.blocked()) return i;
       const byte = src[i];
       const slot = this.read % size;
       this.ring[slot] = byte;
@@ -120,7 +130,7 @@ class IndexedLiterals {
         if (prev === 0 || this.literals[prev - 1].length < length) this.matches[pos] = p + 1;
       }
       this.settle(false);
-      if (this.out.blocked) return i + 1;
+      if (this.owner.blocked()) return i + 1;
     }
     this.flushPlain();
     return end;
@@ -143,15 +153,14 @@ class IndexedLiterals {
         continue;
       }
       this.flushPlain();
-      if (this.out.blocked) return;
+      if (this.owner.blocked()) return;
       const length = this.literals[match - 1].length;
-      // A fresh copy, so returning it is safe.
-      const payload = this.copy(this.at, length);
-      const value = this.resolve(payload, match - 1);
+      const table = this.owner.table;
+      if (table !== undefined) this.owner.replace(table[match - 1]);
+      else this.owner.resolveCopy(match - 1, this.copy(this.at, length));
       this.at += length;
       this.plain = this.at;
-      this.out.emit(value === null ? payload : value);
-      if (this.out.blocked) return;
+      if (this.owner.blocked()) return;
     }
   }
 
@@ -159,7 +168,7 @@ class IndexedLiterals {
     if (this.plain === this.at) return;
     const bytes = this.copy(this.plain, this.at - this.plain);
     this.plain = this.at;
-    this.out.emit(bytes);
+    this.owner.send(bytes);
   }
 
   private copy(from: number, length: number): Uint8Array {
@@ -216,13 +225,6 @@ export function compileLiterals(
   return compiled;
 }
 
-function kindOf(value: unknown): string {
-  if (value === null) return "null";
-  if (typeof value !== "object") return typeof value;
-  if (Array.isArray(value)) return "array";
-  return value.constructor?.name ?? "object";
-}
-
 /** @internal */
 export function compileLiteralOptions(options: LiteralTransformOptions): CompiledLiteralOptions {
   if (options == null || typeof options !== "object") {
@@ -234,52 +236,36 @@ export function compileLiteralOptions(options: LiteralTransformOptions): Compile
   );
   if (set === undefined) throw new TypeError("literals must come from compileLiterals");
 
-  const user = options.resolve;
-  let resolve: ByteResolver;
-  if (user === undefined) {
-    if (set.values === undefined) {
-      throw new TypeError("resolve is required when literals is an array");
-    }
-    const table = set.values;
-    resolve = (_literal, index) => table[index];
-  } else if (typeof user !== "function") {
-    throw new TypeError("resolve must be a function");
-  } else {
-    resolve = (literal, index) => {
-      const value: unknown = user(literal, index);
-      if (value === null || value instanceof Uint8Array) return value;
-      if (typeof value === "string") return encodeText(value, "replacement");
-      throw new TypeError(`resolve must return Uint8Array, string, or null; got ${kindOf(value)}`);
-    };
-  }
-
-  const flushBytes = options.flushBytes ?? 16384;
-  if (!isByteCount(flushBytes)) {
-    throw new RangeError("flushBytes must be a non-negative safe integer");
-  }
-  return { set, resolve, flushBytes, onDone: optionalFunction(options.onDone, "onDone") };
+  const resolve = optionalFunction(options.resolve, "resolve") ?? set.values;
+  if (resolve === undefined) throw new TypeError("resolve is required when literals is an array");
+  return {
+    set,
+    resolve,
+    ...compileShared(options),
+    onResolveError: optionalFunction(options.onResolveError, "onResolveError"),
+    onDone: optionalFunction(options.onDone, "onDone"),
+  };
 }
 
-/** Leftmost-longest literal scanner. Held bytes are bounded by the longest literal. */
-export class LiteralSubstituter {
-  done = false;
-  paused = false;
+/** Stands in for the user resolver when a table answers every match. */
+const unreachable: LiteralResolver = () => null;
+
+/** @internal Leftmost-longest literal scanner. Held bytes are bounded by the longest literal. */
+export class LiteralSubstituter extends Lookahead {
+  /** Replacements by index when they come from the literal set. */
+  readonly table: Uint8Array[] | undefined;
+  private readonly user: LiteralResolver;
+  private readonly onDone: ((stats: LiteralStats) => void) | undefined;
+  private readonly literals: readonly Uint8Array[];
+  private readonly ac: AhoCorasick;
   private chunk: Uint8Array = EMPTY;
   private bridgeTake = 0;
-  private flushing = false;
   private flushTail = false;
   private index: IndexedLiterals | undefined;
   private replayed = 0;
   private pendingCommit = false;
-  private readonly resolve: ByteResolver;
-  private readonly onDone: ((stats: LiteralStats) => void) | undefined;
-  private readonly out: Emitter;
-  private readonly literals: readonly Uint8Array[];
-  private readonly ac: AhoCorasick;
-
-  private bytesIn = 0;
-  private substituted = 0;
-  private rejected = 0;
+  /** The current step stopped on a halt. */
+  private stalled = false;
 
   /** Tail that may still match: held bytes, then the next chunk bridge. */
   private hold: Uint8Array<ArrayBuffer> = EMPTY;
@@ -298,78 +284,92 @@ export class LiteralSubstituter {
   private candLen = 0;
   private candIdx = -1;
 
-  constructor(options: LiteralTransformOptions) {
+  constructor(options: LiteralTransformOptions, onClose: (failure?: { reason: unknown }) => void) {
     const compiled = compileLiteralOptions(options);
+    super(compiled, onClose);
     this.literals = compiled.set.literals;
     this.ac = compiled.set.ac;
-    this.resolve = compiled.resolve;
+    const resolve = compiled.resolve;
+    this.table = Array.isArray(resolve) ? resolve : undefined;
+    this.user = Array.isArray(resolve) ? unreachable : resolve;
     this.onDone = compiled.onDone;
-    this.out = new Emitter(compiled.flushBytes);
   }
 
-  transform(chunk: Uint8Array, ctrl: Controller): void {
+  blocked(): boolean {
+    return this.halted();
+  }
+
+  send(part: Uint8Array): void {
+    this.emit(part);
+  }
+
+  /** A table replacement, never pending. */
+  replace(value: Uint8Array): void {
+    this.emit(value);
+    this.replaced++;
+  }
+
+  /** Resolve a match through the user resolver. `copy` is a fresh copy of its bytes. */
+  resolveCopy(index: number, copy: Uint8Array): void {
+    let value: unknown;
+    let promise: Promise<unknown> | undefined;
+    let failed = false;
+    let error: unknown;
     try {
-      if (!(chunk instanceof Uint8Array)) throw new TypeError("chunk must be a Uint8Array");
-      this.out.ctrl = ctrl;
-      this.bytesIn += chunk.length;
-      this.chunk = chunk;
-      if (chunk.length > 0) this.consume(chunk, chunk.length);
-      if (!this.paused) this.finishChunk();
-    } catch (error) {
-      this.reset();
-      throw error;
+      value = this.user(copy, index, this.context);
+      if (!(value instanceof Uint8Array)) promise = toPromise(value);
+    } catch (thrown) {
+      failed = true;
+      error = thrown;
     }
+    if (value instanceof Uint8Array && !this.stopped) this.replace(value);
+    else this.accept(value, promise, failed, error, copy);
   }
 
-  private finishChunk(): void {
+  protected begin(chunk: Uint8Array): void {
+    this.chunk = chunk;
+    if (chunk.length > 0) this.enterChunk(chunk, chunk.length);
+  }
+
+  protected beginFlush(): boolean {
+    return true;
+  }
+
+  protected step(): boolean {
+    this.stalled = false;
+    if (this.flushing) {
+      this.flushHeld();
+      return !this.stalled;
+    }
+    if (this.chunk.length > 0) {
+      this.continueConsume();
+      if (this.stalled) return false;
+    }
     if (this.index !== undefined) {
       this.hold = EMPTY;
       this.holdLen = 0;
     }
-    this.out.flush();
-    this.out.ctrl = undefined;
     this.src = this.chunk = EMPTY;
+    return true;
   }
 
-  resumeOutput(ctrl: Controller): void {
-    if (!this.paused) return;
-    this.paused = false;
-    if (this.flushing) {
-      this.flush(ctrl);
-      return;
-    }
-    this.out.ctrl = ctrl;
-    this.continueConsume();
-    if (!this.paused) this.finishChunk();
+  protected verbatim(payload: Uint8Array, sink: (part: Uint8Array) => void): void {
+    sink(payload);
   }
 
-  flush(ctrl: Controller): void {
-    this.out.ctrl = ctrl;
-    this.flushing = true;
-    try {
-      this.flushHeld();
-      if (this.paused) return;
-      this.out.flush();
-    } catch (error) {
-      this.reset();
-      throw error;
-    }
-    this.reset();
-    this.done = true;
-    if (this.onDone !== undefined) {
-      this.onDone({
-        substituted: this.substituted,
-        rejected: this.rejected,
-        bytesIn: this.bytesIn,
-        bytesOut: this.out.bytesOut,
-      });
-    }
+  protected report(bytesOut: number): void {
+    this.onDone?.({
+      replaced: this.replaced,
+      rejected: this.rejected,
+      bytesIn: this.bytesIn,
+      bytesOut,
+    });
   }
 
   private flushHeld(): void {
     if (this.index !== undefined) {
       this.scan();
-      if (!this.paused) this.paused = !this.index.finish();
+      if (!this.stalled) this.stalled = !this.index.finish();
       return;
     }
     if (this.holdLen > 0 && !this.flushTail) {
@@ -380,30 +380,30 @@ export class LiteralSubstituter {
       this.flushTail = true;
       if (tail.length > 256) {
         const index = this.indexedScan(0);
-        if (this.paused) return;
-        this.paused = !index.finish();
+        if (this.stalled) return;
+        this.stalled = !index.finish();
         return;
       }
     }
     if (this.flushTail) {
       this.scan();
-      if (this.paused) return;
+      if (this.stalled) return;
       // A re-scan behind a decided match can leave a fresh candidate.
       while (this.candStart >= 0) {
         this.commit();
-        if (this.out.blocked) {
-          this.paused = true;
+        if (this.halted()) {
+          this.stalled = true;
           return;
         }
         this.scan();
-        if (this.paused) return;
+        if (this.stalled) return;
       }
-      this.emitSpan(this.srcEnd);
+      this.emitUpTo(this.srcEnd);
     }
   }
 
-  /** Scan one chunk, bridging a window the previous one stranded. */
-  private consume(chunk: Uint8Array, count: number): void {
+  /** Enter a chunk, bridging a window the previous one stranded. */
+  private enterChunk(chunk: Uint8Array, count: number): void {
     if (this.holdLen > 0) {
       const held = this.holdLen;
       const take = this.ac.maxLength < count ? this.ac.maxLength : count;
@@ -415,12 +415,11 @@ export class LiteralSubstituter {
     } else {
       this.enter(chunk, count, false, 0, 0);
     }
-    this.continueConsume();
   }
 
   private continueConsume(): void {
     this.scan();
-    if (this.paused) return;
+    if (this.stalled) return;
     const take = this.bridgeTake;
     if (take > 0) {
       this.bridgeTake = 0;
@@ -433,12 +432,12 @@ export class LiteralSubstituter {
       // The surviving window lies wholly in the bridged bytes, so rebase it.
       const held = this.srcEnd - take;
       const ws = this.srcEnd - this.windowLen();
-      this.emitSpan(ws);
+      this.emitUpTo(ws);
       this.holdLen = 0;
       if (this.candStart >= 0) this.candStart -= held;
       this.enter(chunk, count, false, take, ws - held);
       this.scan();
-      if (this.paused) return;
+      if (this.stalled) return;
     }
     this.park();
   }
@@ -461,7 +460,7 @@ export class LiteralSubstituter {
   private scan(): void {
     if (this.pendingCommit) {
       this.commit();
-      if (this.paused) return;
+      if (this.stalled) return;
     }
     if (this.index !== undefined) {
       this.i = this.index.scan(this.src, this.i, this.srcEnd);
@@ -469,7 +468,7 @@ export class LiteralSubstituter {
       this.node = 0;
       this.candStart = -1;
       this.candLen = 0;
-      this.paused = this.out.blocked;
+      this.stalled = this.halted();
       return;
     }
     const {
@@ -529,7 +528,7 @@ export class LiteralSubstituter {
         this.candLen = candLen;
         this.candIdx = candIdx;
         this.commit();
-        if (this.paused) return;
+        if (this.stalled) return;
         this.replayed += i - this.i;
         if (this.replayed > Math.max(1024, this.bytesIn)) {
           this.indexedScan(this.i);
@@ -540,8 +539,8 @@ export class LiteralSubstituter {
         node = 0;
         candStart = -1;
         candLen = 0;
-        if (this.out.blocked) {
-          this.paused = true;
+        if (this.halted()) {
+          this.stalled = true;
           break;
         }
       }
@@ -556,17 +555,7 @@ export class LiteralSubstituter {
 
   /** Switch once, retaining the index across chunks. */
   private indexedScan(from: number): IndexedLiterals {
-    const index = new IndexedLiterals(
-      this.literals,
-      this.ac,
-      (payload, at) => {
-        const value = this.resolve(payload, at);
-        if (value === null) this.rejected++;
-        else this.substituted++;
-        return value;
-      },
-      this.out,
-    );
+    const index = new IndexedLiterals(this.literals, this.ac, this);
     this.index = index;
     this.i = from;
     this.scan();
@@ -577,25 +566,16 @@ export class LiteralSubstituter {
   private commit(): void {
     const start = this.candStart;
     const end = start + this.candLen;
-    this.emitSpan(start);
-    if (this.out.blocked) {
+    this.emitUpTo(start);
+    if (this.halted()) {
       this.pendingCommit = true;
-      this.paused = true;
+      this.stalled = true;
       return;
     }
     this.pendingCommit = false;
-    const value = this.resolve(this.src.subarray(start, end), this.candIdx);
-    if (value === null) {
-      // Atomic: verbatim, and not re-scanned.
-      this.emitRange(start, end);
-      this.rejected++;
-    } else {
-      // A view of a buffer the scanner reuses must be copied to outlive it.
-      if (value.length > 0) {
-        this.out.emit(this.srcOwned && value.buffer === this.src.buffer ? value.slice() : value);
-      }
-      this.substituted++;
-    }
+    const table = this.table;
+    if (table !== undefined) this.replace(table[this.candIdx]);
+    else this.resolveCopy(this.candIdx, this.src.slice(start, end));
     this.i = end;
     this.flushStart = end;
     this.node = 0;
@@ -615,7 +595,7 @@ export class LiteralSubstituter {
   private park(): void {
     const end = this.srcEnd;
     const ws = end - this.windowLen();
-    this.emitSpan(ws);
+    this.emitUpTo(ws);
     if (ws < end) {
       this.ensureHold(end - ws);
       // May move within `hold` itself, but only leftwards.
@@ -627,9 +607,9 @@ export class LiteralSubstituter {
     }
   }
 
-  private emitSpan(to: number): void {
+  private emitUpTo(to: number): void {
     if (to > this.flushStart) {
-      this.emitRange(this.flushStart, to);
+      this.emitSpan(this.src, this.flushStart, to, this.srcOwned);
       this.flushStart = to;
     }
   }
@@ -642,21 +622,10 @@ export class LiteralSubstituter {
     this.hold = next;
   }
 
-  private emitRange(from: number, to: number): void {
-    const src = this.src;
-    if (this.srcOwned) this.out.emit(src.slice(from, to));
-    else this.out.emitRange(src, from, to);
-  }
-
-  cancel(): void {
-    this.reset();
-  }
-
-  private reset(): void {
-    this.paused = false;
+  protected clear(): void {
     this.chunk = EMPTY;
     this.bridgeTake = 0;
-    this.flushing = this.flushTail = false;
+    this.flushTail = false;
     this.index = undefined;
     this.replayed = 0;
     this.pendingCommit = false;
@@ -669,42 +638,12 @@ export class LiteralSubstituter {
     this.srcEnd = 0;
     this.i = 0;
     this.flushStart = 0;
-    this.out.reset();
   }
 }
 
 /** Body for `new TransformStream(...)`. Single use. */
 export function createLiteralTransformer(options: LiteralTransformOptions): LiteralTransformer {
-  const session = new Session<LiteralSubstituter>(options?.signal);
-  session.open(new LiteralSubstituter(options));
-  const guard = (action: (s: LiteralSubstituter) => void): void => {
-    const s = session.scanner;
-    if (s === undefined) throw session.inactive();
-    try {
-      action(s);
-    } catch (error) {
-      session.cancel(error);
-      throw error;
-    }
-  };
-  const body: LiteralTransformer & FlowBody = {
-    get paused() {
-      return session.scanner?.paused ?? false;
-    },
-    resume: (ctrl: Controller) =>
-      guard((s) => {
-        s.resumeOutput(ctrl);
-        if (s.done) session.close();
-      }),
-    transform: (chunk: Uint8Array, ctrl: Controller) => guard((s) => s.transform(chunk, ctrl)),
-    flush: (ctrl: Controller) =>
-      guard((s) => {
-        s.flush(ctrl);
-        if (!s.paused) session.close();
-      }),
-    cancel: (reason?: unknown) => session.cancel(reason),
-  };
-  return body;
+  return lookaheadBody(options?.signal, (onClose) => new LiteralSubstituter(options, onClose));
 }
 
 /** Backpressured pair for `pipeThrough`. Single use. */

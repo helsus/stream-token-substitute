@@ -18,7 +18,7 @@ import type { LiteralTransformOptions } from "../src/literals.ts";
 import { compileLiterals, createLiteralStream, createLiteralTransformer } from "../src/literals.ts";
 import { createLiteralTransform, createTokenTransform } from "../src/node.ts";
 import { createTokenStream, createTokenTransformer } from "../src/transformer.ts";
-import type { TokenTransformOptions } from "../src/types.ts";
+import type { ResolveContext, TokenTransformOptions } from "../src/types.ts";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -346,7 +346,8 @@ function asyncScenario(): Scenario {
   const direct = { ...tokenOptions };
   const awaited = {
     ...tokenOptions,
-    resolve: (payload: Uint8Array) => Promise.resolve(tokenOptions.resolve(payload)),
+    resolve: (payload: Uint8Array, context: ResolveContext) =>
+      Promise.resolve(tokenOptions.resolve(payload, context)),
   };
   return {
     title: "async resolver, 5001 holes",

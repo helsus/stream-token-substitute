@@ -1,4 +1,4 @@
-import { type Duplex, Transform, type TransformCallback } from "node:stream";
+import { Transform, type TransformCallback } from "node:stream";
 import type { FlowBody, OutputController } from "./flow.ts";
 import { createLiteralTransformer, type LiteralTransformOptions } from "./literals.ts";
 import { createTokenTransformer } from "./transformer.ts";
@@ -136,7 +136,7 @@ class SubstituteTransform extends Transform {
 export function createTokenTransform(
   options: TokenTransformOptions,
   stream?: NodeStreamOptions,
-): Duplex {
+): Transform {
   return new SubstituteTransform(createTokenTransformer(options), stream);
 }
 
@@ -144,6 +144,6 @@ export function createTokenTransform(
 export function createLiteralTransform(
   options: LiteralTransformOptions,
   stream?: NodeStreamOptions,
-): Duplex {
+): Transform {
   return new SubstituteTransform(createLiteralTransformer(options), stream);
 }

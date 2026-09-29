@@ -1,7 +1,15 @@
 // The unified resolver contract and ordered lookahead.
 
+import { Transform } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { createTokenTransform } from "../src/node.ts";
+import { resolveName } from "../src/helpers.ts";
+import {
+  createLiteralStream,
+  createLiteralTransformer,
+  type LiteralStats,
+  type LiteralTransformOptions,
+} from "../src/literals.ts";
+import { createLiteralTransform, createTokenTransform } from "../src/node.ts";
 import { createTokenStream, createTokenTransformer } from "../src/transformer.ts";
 import type { TokenStats, TokenTransformOptions } from "../src/types.ts";
 import { bytes, concat, decoder, deferred, runStream } from "./helpers.ts";
@@ -11,6 +19,7 @@ const run = async (input: string | string[], options: Omit<TokenTransformOptions
   decoder.decode(
     await runStream((Array.isArray(input) ? input : [input]).map(bytes), { ...base, ...options }),
   );
+const E = String.fromCodePoint(0xe9);
 const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 
 function streamOf(parts: string[], onCancel: (reason: unknown) => void = () => {}) {
@@ -54,7 +63,7 @@ describe("resolver contract", () => {
     [undefined, "undefined"],
     [42, "number"],
     [{}, "object"],
-    [[1], "array"],
+    [true, "boolean"],
   ] as const) {
     it(`rejects a ${kind} result with a TypeError`, async () => {
       const message = `resolve must return Uint8Array, string, null, a stream, or a promise of one; got ${kind}`;
@@ -82,7 +91,7 @@ describe("resolver contract", () => {
       },
     });
     expect(out).toBe("a<x>bYc");
-    expect(stats).toMatchObject({ resolved: 2, rejected: 0 });
+    expect(stats).toMatchObject({ replaced: 2, rejected: 0 });
   });
 });
 
@@ -159,12 +168,12 @@ describe("lookahead", () => {
     expect(out).toBe("[r1r2|g1g2|l1|X]");
   });
 
-  it("rejects a stream piece that is not a Uint8Array", async () => {
+  it("rejects a stream piece that is not bytes or a string", async () => {
     async function* bad() {
-      yield "text" as unknown as Uint8Array;
+      yield 42 as unknown as Uint8Array;
     }
     await expect(run("{{x}}", { resolve: () => bad() })).rejects.toThrow(
-      "replacement stream must yield Uint8Array chunks",
+      "replacement stream must yield Uint8Array or string chunks",
     );
   });
 
@@ -235,7 +244,7 @@ describe("background failure and drain", () => {
   const failures = [
     ["rejected lookup", () => sleep(5).then(() => Promise.reject(new Error("late")))],
     ["throwing stream", () => throwing()],
-    ["non-byte piece", () => late("text")],
+    ["non-byte piece", () => late(42)],
   ] as const;
 
   for (const [name, resolve] of failures) {
@@ -311,4 +320,342 @@ describe("background failure and drain", () => {
       expect(total).toBe(target);
     });
   }
+});
+
+async function pipeText(
+  tx: ReadableWritablePair<Uint8Array, Uint8Array>,
+  input: string[],
+): Promise<string> {
+  const reader = tx.readable.getReader();
+  const writer = tx.writable.getWriter();
+  const parts: Uint8Array[] = [];
+  const pump = (async () => {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+    }
+  })();
+  pump.catch(() => {});
+  for (const chunk of input) await writer.write(bytes(chunk));
+  await writer.close();
+  await pump;
+  return decoder.decode(concat(parts));
+}
+
+describe("resolve context", () => {
+  it("does not create an AbortController unless a resolver reads the signal", async () => {
+    const Native = globalThis.AbortController;
+    let created = 0;
+    globalThis.AbortController = class extends Native {
+      constructor() {
+        super();
+        created++;
+      }
+    };
+    try {
+      expect(await run("{{a}}", { resolve: () => "x" })).toBe("x");
+      expect(created).toBe(0);
+      expect(
+        await run("{{a}}{{b}}", { resolve: (_p, context) => (context.signal ? "y" : "") }),
+      ).toBe("yy");
+      expect(created).toBe(1);
+    } finally {
+      globalThis.AbortController = Native;
+    }
+  });
+
+  it("aborts the signal with the cancel reason, and not on completion", async () => {
+    const signals: AbortSignal[] = [];
+    const gate = deferred<string>();
+    const body = createTokenTransformer({
+      resolve: (_p, context) => {
+        signals.push(context.signal);
+        return gate.promise;
+      },
+    });
+    const ctrl = { enqueue() {} } as unknown as TransformStreamDefaultController<Uint8Array>;
+    await body.transform(bytes("{{a}}{{b}}"), ctrl);
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).toBe(signals[1]);
+    body.cancel?.("stop");
+    expect(signals[0].aborted).toBe(true);
+    expect(signals[0].reason).toBe("stop");
+
+    let done: AbortSignal | undefined;
+    await run("{{a}}", {
+      resolve: async (_p, context) => {
+        done = context.signal;
+        return "x";
+      },
+    });
+    expect(done?.aborted).toBe(false);
+  });
+
+  it("aborts the signal from the options signal and on failure", async () => {
+    const abort = new AbortController();
+    let seen: AbortSignal | undefined;
+    const body = createTokenTransformer({
+      signal: abort.signal,
+      resolve: (_p, context) => {
+        seen = context.signal;
+        return new Promise<null>(() => {});
+      },
+    });
+    const ctrl = { enqueue() {} } as unknown as TransformStreamDefaultController<Uint8Array>;
+    await body.transform(bytes("{{a}}"), ctrl);
+    abort.abort("gone");
+    expect(seen?.reason).toBe("gone");
+
+    const failure = new Error("down");
+    let failed: AbortSignal | undefined;
+    await expect(
+      run("{{a}}{{b}}", {
+        resolve: (p, context) => {
+          failed = context.signal;
+          return p[0] === 0x61 ? new Promise<null>(() => {}) : Promise.reject(failure);
+        },
+      }),
+    ).rejects.toBe(failure);
+    expect(failed?.reason).toBe(failure);
+  });
+
+  it("passes the same context to onResolveError", async () => {
+    const contexts: unknown[] = [];
+    const out = await run("{{a}}", {
+      resolve: (_p, context) => {
+        contexts.push(context);
+        throw new Error("down");
+      },
+      onResolveError: (_error, _payload, context) => {
+        contexts.push(context);
+        return "R";
+      },
+    });
+    expect(out).toBe("R");
+    expect(contexts[0]).toBe(contexts[1]);
+  });
+});
+
+describe("replacement pieces", () => {
+  it("encodes string pieces and reads sync iterables", async () => {
+    async function* mixed() {
+      yield "s";
+      yield bytes("b");
+      yield "";
+    }
+    const out = await run("[{{a}}|{{b}}|{{c}}]", {
+      resolve: (p) =>
+        p[0] === 0x61 ? ["x", bytes("y"), "z"] : p[0] === 0x62 ? mixed() : new Set(["q"]),
+    });
+    expect(out).toBe("[xyz|sb|q]");
+  });
+
+  it("treats strings and bytes as values, not iterables", async () => {
+    expect(await run("{{a}}{{b}}", { resolve: (p) => (p[0] === 0x61 ? "ab" : bytes("cd")) })).toBe(
+      "abcd",
+    );
+  });
+
+  it("reads a ReadableStream of strings from TextDecoderStream", async () => {
+    const out = await run("<{{a}}>", {
+      resolve: () =>
+        new ReadableStream<BufferSource>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([0x68, 0xc3]));
+            controller.enqueue(new Uint8Array([0xa9, 0x6c, 0x6c, 0x6f]));
+            controller.close();
+          },
+        }).pipeThrough(new TextDecoderStream()),
+    });
+    expect(out).toBe(`<h${E}llo>`);
+  });
+});
+
+describe("resolveName", () => {
+  it("decodes the payload as UTF-8", async () => {
+    const resolve = resolveName((name) => (name === `${E}t${E}` ? "summer" : name.toUpperCase()));
+    expect(await run(`{{ab}} {{${E}t${E}}}`, { resolve })).toBe("AB summer");
+  });
+
+  it("passes the context and awaits results", async () => {
+    let seen: AbortSignal | undefined;
+    const resolve = resolveName(async (name, context) => {
+      seen = context.signal;
+      return `<${name}>`;
+    });
+    expect(await run("{{x}}", { resolve })).toBe("<x>");
+    expect(seen).toBeInstanceOf(AbortSignal);
+  });
+
+  it("replaces invalid bytes", async () => {
+    const names: string[] = [];
+    const resolve = resolveName((name) => {
+      names.push(name);
+      return null;
+    });
+    await runStream([new Uint8Array([0x7b, 0x7b, 0xff, 0x7d, 0x7d])], { resolve });
+    expect(names).toEqual([String.fromCodePoint(0xfffd)]);
+  });
+});
+
+describe("delimiter defaults", () => {
+  it("defaults to {{ and }}", async () => {
+    const out = decoder.decode(
+      await runStream([bytes("a{{x}}b")], { resolve: () => "X" } as TokenTransformOptions),
+    );
+    expect(out).toBe("aXb");
+  });
+
+  it("keeps close equal to a given open", async () => {
+    expect(
+      decoder.decode(await runStream([bytes("a%x%b")], { open: "%", resolve: () => "X" })),
+    ).toBe("aXb");
+  });
+
+  it("defaults open when only close is given", async () => {
+    expect(
+      decoder.decode(await runStream([bytes("a{{x]]b")], { close: "]]", resolve: () => "X" })),
+    ).toBe("aXb");
+  });
+});
+
+describe("node factories", () => {
+  it("return a Transform", () => {
+    expect(createTokenTransform({ resolve: () => null })).toBeInstanceOf(Transform);
+    expect(createLiteralTransform({ literals: { a: "b" } })).toBeInstanceOf(Transform);
+  });
+});
+
+describe("literal lookahead", () => {
+  const literal = (options: Omit<LiteralTransformOptions, "literals">, input: string[]) =>
+    pipeText(createLiteralStream({ literals: ["a", "b", "c"], ...options }), input);
+
+  it("keeps output order when later lookups settle first", async () => {
+    const started: string[] = [];
+    const out = await literal(
+      {
+        resolve: async (bytes, index) => {
+          started.push(decoder.decode(bytes));
+          await sleep(index === 0 ? 20 : index === 1 ? 10 : 0);
+          return decoder.decode(bytes).toUpperCase();
+        },
+      },
+      ["<a|b", "|c>"],
+    );
+    expect(out).toBe("<A|B|C>");
+    expect(started).toEqual(["a", "b", "c"]);
+  });
+
+  for (const concurrency of [1, 2]) {
+    it(`keeps at most ${concurrency} lookups in flight`, async () => {
+      let inFlight = 0;
+      let peak = 0;
+      const out = await literal(
+        {
+          concurrency,
+          resolve: async (bytes) => {
+            peak = Math.max(peak, ++inFlight);
+            await sleep(1);
+            inFlight--;
+            return `<${decoder.decode(bytes)}>`;
+          },
+        },
+        ["xabcab", "cy"],
+      );
+      expect(out).toBe("x<a><b><c><a><b><c>y");
+      expect(peak).toBe(concurrency);
+    });
+  }
+
+  it("streams replacements and hands out a retainable copy", async () => {
+    const seen: Uint8Array[] = [];
+    const out = await literal(
+      {
+        resolve: (bytes, index) => {
+          seen.push(bytes);
+          if (index === 0) return streamOf(["1", "2"]);
+          if (index === 1) return sleep(1).then(() => ["3", bytes]);
+          return null;
+        },
+      },
+      ["ab", "c"],
+    );
+    expect(out).toBe("123bc");
+    expect(seen.map((b) => decoder.decode(b))).toEqual(["a", "b", "c"]);
+  });
+
+  it("recovers through onResolveError, sync and async", async () => {
+    let stats: LiteralStats | undefined;
+    const out = await literal(
+      {
+        resolve: (_bytes, index) => {
+          if (index === 0) throw new Error("sync");
+          if (index === 1) return Promise.reject(new Error("async"));
+          return "C";
+        },
+        onResolveError: async (error, bytes) =>
+          `${(error as Error).message}:${decoder.decode(bytes)}`,
+        onDone: (s) => {
+          stats = s;
+        },
+      },
+      ["abc"],
+    );
+    expect(out).toBe("sync:aasync:bC");
+    expect(stats).toEqual({ replaced: 3, rejected: 0, bytesIn: 3, bytesOut: out.length });
+  });
+
+  it("surfaces a background failure after the write settled", async () => {
+    const tx = createLiteralStream({
+      literals: ["a"],
+      resolve: () => sleep(5).then(() => Promise.reject(new Error("late"))),
+    });
+    const writer = tx.writable.getWriter();
+    const reader = tx.readable.getReader();
+    const read = reader.read().then(
+      () => "read",
+      (error: unknown) => error,
+    );
+    await writer.write(bytes("a"));
+    await expect(Promise.race([read, sleep(500).then(() => "hung")])).resolves.toBeInstanceOf(
+      Error,
+    );
+    writer.releaseLock();
+  });
+
+  for (const promised of [false, true]) {
+    it(`handles abort inside a ${promised ? "promised" : "direct"} literal resolver`, async () => {
+      const abort = new AbortController();
+      const failure = new Error("abort in resolver");
+      let calls = 0;
+      const body = createLiteralTransformer({
+        literals: ["a"],
+        signal: abort.signal,
+        resolve: () => {
+          calls++;
+          abort.abort(failure);
+          return promised ? Promise.reject(new Error("late")) : null;
+        },
+      });
+      const ctrl = { enqueue() {} } as unknown as TransformStreamDefaultController<Uint8Array>;
+      await expect(body.transform(bytes("aa"), ctrl)).rejects.toBe(failure);
+      expect(calls).toBe(1);
+    });
+  }
+
+  it("aborts the context signal on cancel", async () => {
+    let seen: AbortSignal | undefined;
+    const body = createLiteralTransformer({
+      literals: ["a"],
+      resolve: (_bytes, _index, context) => {
+        seen = context.signal;
+        return new Promise<null>(() => {});
+      },
+    });
+    const ctrl = { enqueue() {} } as unknown as TransformStreamDefaultController<Uint8Array>;
+    await body.transform(bytes("a"), ctrl);
+    body.cancel?.("stop");
+    expect(seen?.reason).toBe("stop");
+  });
 });

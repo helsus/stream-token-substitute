@@ -1,11 +1,10 @@
-import { copyBytes, EMPTY, encodeText, requeue } from "./bytes.ts";
-import { type Controller, type FlowBody, flowStream, Session } from "./flow.ts";
+import { copyBytes, EMPTY, requeue } from "./bytes.ts";
+import { flowStream } from "./flow.ts";
+import { Lookahead, lookaheadBody, toPromise } from "./lookahead.ts";
 import { COMPLETE, DelimiterMatcher, REJECTED } from "./matcher.ts";
-import { Emitter } from "./output.ts";
 import {
   compileOptions,
   type PayloadValidator,
-  type ResolveErrorHandler,
   type TokenResolver,
   type TokenStats,
   type TokenTransformer,
@@ -15,107 +14,21 @@ import {
 /** Cached payload views per length, so validator calls allocate nothing. */
 const VIEW_CACHE_MAX = 128;
 
-/** Bytes held behind pending slots before scanning waits. */
-const HELD_LIMIT = 65536;
-
-/** A pending token plus the output queued behind it. */
-interface Slot {
-  owner: Substituter | undefined;
-  /** undefined while pending. A drained stream becomes EMPTY. */
-  value: Uint8Array | AsyncIterator<Uint8Array> | undefined;
-  /** Rejected: value is the payload, emitted between the delimiters. */
-  verbatim: boolean;
-  /** Copy for onResolveError and a late null. */
-  payload: Uint8Array;
-  reading: boolean;
-  /** Already went through onResolveError. */
-  recovered: boolean;
-  after: Uint8Array[];
-  /** Why the slot was released, passed to a late stream. */
-  reason: unknown;
-  /** Bytes this slot contributes to `held`. */
-  held: number;
-}
-
-const noop = () => {};
-
-function isObject(value: unknown): value is object {
-  return value !== null && (typeof value === "object" || typeof value === "function");
-}
-
-function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
-  return isObject(value) && Symbol.asyncIterator in value;
-}
-
-/** The iterator of a stream or async iterable result, or undefined. */
-function iteratorOf(value: unknown): AsyncIterator<Uint8Array> | undefined {
-  return isAsyncIterable(value) ? value[Symbol.asyncIterator]() : undefined;
-}
-
-function invalid(value: unknown): TypeError {
-  const kind = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
-  return new TypeError(
-    `resolve must return Uint8Array, string, null, a stream, or a promise of one; got ${kind}`,
-  );
-}
-
-/** A native promise for a thenable, or undefined. Reads `then` once. */
-function toPromise(value: unknown): Promise<unknown> | undefined {
-  if (value instanceof Promise) return Promise.resolve(value);
-  if (!isObject(value) || value instanceof Uint8Array) return undefined;
-  const then: unknown = Reflect.get(value, "then");
-  if (typeof then !== "function") return undefined;
-  // biome-ignore lint/suspicious/noThenProperty: intentional thenable assimilation
-  return Promise.resolve({ then: then.bind(value) });
-}
-
-function quiet(pending: unknown): void {
-  if (pending instanceof Promise) Promise.prototype.then.call(pending, undefined, noop);
-}
-
-/** Cancel a stream nobody will read. A ReadableStream gets `reason` as its cancel reason. */
-function closeIterator(iter: AsyncIterator<Uint8Array> | undefined, reason: unknown): void {
-  try {
-    quiet(iter?.return?.(reason));
-  } catch {}
-}
-
-function releaseSlot(slot: Slot, reason: unknown): void {
-  slot.owner = undefined;
-  slot.reason = reason;
-  slot.after.length = 0;
-  slot.payload = EMPTY;
-  const value = slot.value;
-  slot.value = EMPTY;
-  if (value !== undefined && !(value instanceof Uint8Array)) closeIterator(value, reason);
-}
-
-interface Waiter {
-  resolve: () => void;
-  reject: (reason: unknown) => void;
-}
-
-/** Token scanner. State lives in fields, so it can halt and resume at a token boundary. */
-export class Substituter {
-  paused = false;
+/** @internal Token scanner. State lives in fields, so it can halt and resume at a token boundary. */
+export class Substituter extends Lookahead {
   private readonly openBytes: Uint8Array;
   private readonly closeBytes: Uint8Array;
   private readonly openFirst: number;
   private readonly closeFirst: number;
   private readonly resolve: TokenResolver;
   private readonly borrows: boolean;
-  private readonly concurrency: number;
   private readonly validate: PayloadValidator | undefined;
-  private readonly onResolveError: ResolveErrorHandler | undefined;
   private readonly onDone: ((stats: TokenStats) => void) | undefined;
-  private readonly onClose: (failure?: { reason: unknown }) => void;
   private readonly maxPayloadBytes: number;
   private readonly scratchLimit: number;
   private readonly openM: DelimiterMatcher;
   private readonly closeM: DelimiterMatcher;
-
-  /** Present only when `onDone` is, so the default path stays untouched. */
-  private readonly stats: TokenStats | undefined;
+  private aborted = 0;
 
   private inToken = false;
   private carry = 0;
@@ -136,7 +49,6 @@ export class Substituter {
 
   // Chunks may be backed by any ArrayBufferLike, including SharedArrayBuffer.
   private chunk: Uint8Array<ArrayBufferLike> = EMPTY;
-  private scanning = false;
 
   // `srcOwned`: src is a reused scratch, so its spans are copied out.
   private src: Uint8Array<ArrayBufferLike> = EMPTY;
@@ -144,8 +56,6 @@ export class Substituter {
   private srcOwned = false;
   private i = 0;
   private flushStart = 0;
-
-  private readonly out: Emitter;
 
   // Re-scan queue, live bytes are queue[0..queueLen).
   private inQueue = false;
@@ -157,286 +67,68 @@ export class Substituter {
   /** An abort re-entered the queue, so the cursor must not advance. */
   private restarted = false;
 
-  // Ordered output queue.
-  private slots: Slot[] = [];
-  /** Slots still pending or streaming. */
-  private live = 0;
-  private held = 0;
-
-  /** Inside transform, resume or flush, until its result settles. */
-  private active = false;
-  private waiter: Waiter | undefined;
-  private flushing = false;
-  private finished = false;
-  private stopped = false;
-  private stopReason: unknown;
-
-  constructor(
-    options: TokenTransformOptions,
-    onClose: (failure?: { reason: unknown }) => void = noop,
-  ) {
+  constructor(options: TokenTransformOptions, onClose: (failure?: { reason: unknown }) => void) {
     const compiled = compileOptions(options);
+    super(compiled, onClose);
     this.openBytes = compiled.openBytes;
     this.closeBytes = compiled.closeBytes;
     this.openFirst = compiled.openBytes[0];
     this.closeFirst = compiled.closeBytes[0];
     this.resolve = compiled.resolve;
     this.borrows = compiled.borrows;
-    this.concurrency = compiled.concurrency;
     this.validate = compiled.validate;
-    this.onResolveError = compiled.onResolveError;
     this.onDone = compiled.onDone;
-    this.onClose = onClose;
     this.maxPayloadBytes = compiled.maxPayloadBytes;
     // Twice the cap without a validator, so compaction stays amortized.
     this.scratchLimit =
       compiled.validate === undefined ? compiled.maxPayloadBytes * 2 : compiled.maxPayloadBytes;
-    this.out = new Emitter(compiled.flushBytes);
     this.openM = new DelimiterMatcher(compiled.openBytes);
     this.closeM = new DelimiterMatcher(compiled.closeBytes);
     this.openScan =
       compiled.validate === undefined ? new DelimiterMatcher(compiled.openBytes) : undefined;
-    this.stats =
-      compiled.onDone === undefined
-        ? undefined
-        : { resolved: 0, rejected: 0, aborted: 0, bytesIn: 0, bytesOut: 0 };
     // The default cap fits the initial scratch, so steady state never grows it.
     this.payload = new Uint8Array(Math.min(compiled.maxPayloadBytes, 64));
   }
 
-  transform(chunk: Uint8Array, ctrl: Controller): void | Promise<void> {
-    if (this.stopped) return Promise.reject(this.stopReason);
-    if (this.flushing) return Promise.reject(new TypeError("transformer is no longer active"));
-    try {
-      if (!(chunk instanceof Uint8Array)) throw new TypeError("chunk must be a Uint8Array");
-      this.chunk = chunk;
-      this.out.ctrl = ctrl;
-      this.enter(chunk, chunk.length, false, 0, 0);
-      this.scanning = true;
-      if (this.stats !== undefined) this.stats.bytesIn += chunk.length;
-      return this.run();
-    } catch (error) {
-      return this.failed(error);
+  protected begin(chunk: Uint8Array): void {
+    this.chunk = chunk;
+    this.enter(chunk, chunk.length, false, 0, 0);
+  }
+
+  protected step(): boolean {
+    if (!this.scan()) return false;
+    this.park();
+    this.chunk = EMPTY;
+    this.src = EMPTY;
+    return true;
+  }
+
+  protected beginFlush(): boolean {
+    if (this.inToken) {
+      this.emit(this.openBytes);
+      if (this.payloadEnd > this.base) this.emit(this.payloadCopy());
+      if (this.closeM.k > 0) this.emit(this.closeBytes.slice(0, this.closeM.k));
+    } else if (this.openM.k > 0) {
+      this.emit(this.openBytes.slice(0, this.openM.k));
     }
+    this.endToken();
+    return false;
   }
 
-  resume(ctrl: Controller): void | Promise<void> {
-    if (this.stopped) return Promise.reject(this.stopReason);
-    if (!this.paused) return;
-    this.out.ctrl = ctrl;
-    try {
-      return this.run();
-    } catch (error) {
-      return this.failed(error);
-    }
+  protected verbatim(payload: Uint8Array, sink: (part: Uint8Array) => void): void {
+    sink(this.openBytes);
+    if (payload.length > 0) sink(payload);
+    sink(this.closeBytes);
   }
 
-  flush(ctrl: Controller): void | Promise<void> {
-    if (this.stopped) throw this.stopReason;
-    this.out.ctrl = ctrl;
-    try {
-      if (this.inToken) {
-        this.emit(this.openBytes);
-        if (this.payloadEnd > this.base) this.emit(this.payloadCopy());
-        if (this.closeM.k > 0) this.emit(this.closeBytes.slice(0, this.closeM.k));
-      } else if (this.openM.k > 0) {
-        this.emit(this.openBytes.slice(0, this.openM.k));
-      }
-      this.endToken();
-      this.flushing = true;
-      return this.run();
-    } catch (error) {
-      this.fail(error, false);
-      throw this.stopReason;
-    }
-  }
-
-  cancel(reason: unknown = new Error("transformer cancelled")): void {
-    this.fail(reason, false);
-  }
-
-  /** Output has room again. Continues a background drain. */
-  poke(): void {
-    if (!this.active && this.slots.length > 0) this.wake();
-  }
-
-  private run(): void | Promise<void> {
-    this.active = true;
-    this.advance();
-    if (this.stopped) throw this.stopReason;
-    if (this.ready()) {
-      this.idle();
-      return;
-    }
-    this.out.flushInitial();
-    return new Promise<void>((resolve, reject) => {
-      this.waiter = { resolve, reject };
+  protected report(bytesOut: number): void {
+    this.onDone?.({
+      replaced: this.replaced,
+      rejected: this.rejected,
+      aborted: this.aborted,
+      bytesIn: this.bytesIn,
+      bytesOut,
     });
-  }
-
-  private failed(error: unknown): Promise<never> {
-    this.fail(error, false);
-    return Promise.reject(this.stopReason);
-  }
-
-  /** Drain, scan, and finish a flush once everything is out. */
-  private advance(): void {
-    this.progress();
-    // Background wakes keep `paused`: the host still owes a resume.
-    if (this.active) {
-      this.paused = this.out.blocked && (this.scanning || this.headReady()) && !this.stopped;
-    }
-    if (this.flushing && !this.finished && !this.stopped && this.slots.length === 0) {
-      this.finish();
-    }
-  }
-
-  private progress(): void {
-    for (;;) {
-      this.drain();
-      if (this.stopped || !this.active || !this.scanning || this.halted()) return;
-      if (!this.scan()) continue;
-      this.park();
-      // Must precede dropping the chunk: buffered spans are views into it.
-      if (this.slots.length === 0) this.out.flush();
-      this.scanning = false;
-      this.chunk = EMPTY;
-      this.src = EMPTY;
-    }
-  }
-
-  private ready(): boolean {
-    if (this.paused || this.finished) return true;
-    if (this.flushing) return false;
-    return !this.scanning && !(this.slots.length > 0 && this.full());
-  }
-
-  /** The current call settled. Only a pending queue keeps the controller. */
-  private idle(): void {
-    this.active = false;
-    this.out.flush();
-    if (this.slots.length === 0 && !this.scanning) this.out.ctrl = undefined;
-  }
-
-  /** A slot settled or a stream piece arrived. */
-  private wake(): void {
-    if (this.stopped || this.finished) return;
-    try {
-      this.advance();
-      if (this.stopped) return;
-      if (this.waiter === undefined) {
-        if (!this.active) this.idle();
-        return;
-      }
-      if (!this.ready()) return;
-      const waiter = this.waiter;
-      this.waiter = undefined;
-      this.idle();
-      waiter.resolve();
-    } catch (error) {
-      this.fail(error);
-    }
-  }
-
-  private finish(): void {
-    this.finished = true;
-    try {
-      this.out.flush();
-    } finally {
-      if (this.stats !== undefined) this.stats.bytesOut = this.out.bytesOut;
-      this.reset();
-      // No error here: its stack trace would retain this scanner.
-      this.onClose();
-    }
-    if (this.stats !== undefined) this.onDone?.(this.stats);
-  }
-
-  private fail(reason: unknown, notify = true): void {
-    if (this.stopped) return;
-    // With no call to reject, the failure goes to the output directly.
-    const ctrl = notify && !this.active && this.waiter === undefined ? this.out.ctrl : undefined;
-    this.stopped = true;
-    this.stopReason = reason;
-    this.reset(reason);
-    this.onClose({ reason });
-    const waiter = this.waiter;
-    this.waiter = undefined;
-    waiter?.reject(reason);
-    try {
-      ctrl?.error(reason);
-    } catch {}
-  }
-
-  private halted(): boolean {
-    return this.out.blocked || (this.slots.length > 0 && this.full());
-  }
-
-  private full(): boolean {
-    return this.live >= this.concurrency || this.held > HELD_LIMIT;
-  }
-
-  private headReady(): boolean {
-    const head = this.slots[0];
-    return head !== undefined && head.value !== undefined && !head.reading;
-  }
-
-  /** Emit settled slots at the head of the queue, in order. */
-  private drain(): void {
-    const slots = this.slots;
-    while (slots.length > 0 && !this.stopped) {
-      const slot = slots[0];
-      const value = slot.value;
-      if (value === undefined || slot.reading || this.out.blocked) return;
-      if (!(value instanceof Uint8Array)) {
-        this.pull(slot, value);
-        return;
-      }
-      if (slot.verbatim) this.out.emit(this.openBytes);
-      this.out.emit(value);
-      if (slot.verbatim) this.out.emit(this.closeBytes);
-      const after = slot.after;
-      for (let p = 0; p < after.length && !this.stopped; p++) this.out.emit(after[p]);
-      this.held -= slot.held;
-      slot.owner = undefined;
-      slots.shift();
-    }
-  }
-
-  /** Read one piece of the head stream. */
-  private pull(slot: Slot, iter: AsyncIterator<Uint8Array>): void {
-    slot.reading = true;
-    Promise.prototype.then.call(
-      Promise.resolve(iter.next()),
-      (result: IteratorResult<Uint8Array>) => slot.owner?.piece(slot, result),
-      (error: unknown) => slot.owner?.fail(error),
-    );
-  }
-
-  private piece(slot: Slot, result: IteratorResult<Uint8Array>): void {
-    slot.reading = false;
-    try {
-      if (result.done) {
-        slot.value = EMPTY;
-        this.live--;
-      } else if (result.value instanceof Uint8Array) this.out.emit(result.value);
-      else throw new TypeError("replacement stream must yield Uint8Array chunks");
-    } catch (error) {
-      this.fail(error);
-      return;
-    }
-    this.wake();
-  }
-
-  /** Route output behind the last slot, or straight out. */
-  private emit(part: Uint8Array): void {
-    const n = this.slots.length;
-    if (n === 0) this.out.emit(part);
-    else if (part.length > 0) {
-      const slot = this.slots[n - 1];
-      slot.after.push(part);
-      slot.held += part.length;
-      this.held += part.length;
-    }
   }
 
   private enter(
@@ -536,7 +228,7 @@ export class Substituter {
           }
         }
 
-        this.step(src[this.i]);
+        this.feed(src[this.i]);
         if (this.restarted) {
           this.restarted = false;
           if (this.halted()) return false;
@@ -581,7 +273,7 @@ export class Substituter {
   }
 
   /** Per-byte automaton. The semantic model. The loops above are its fast paths. */
-  private step(byte: number): void {
+  private feed(byte: number): void {
     if (!this.inToken) {
       const res = this.openM.feed(byte);
       if (res === COMPLETE) {
@@ -635,141 +327,21 @@ export class Substituter {
     const copy = this.borrows ? undefined : this.payloadCopy();
     let value: unknown;
     let promise: Promise<unknown> | undefined;
-    let recovered = false;
+    let failed = false;
+    let error: unknown;
     try {
-      value = this.resolve(copy ?? this.payloadScratch());
+      value = this.resolve(copy ?? this.payloadScratch(), this.context);
       if (!(value instanceof Uint8Array)) promise = toPromise(value);
-    } catch (error) {
-      if (this.stopped) throw this.stopReason;
-      if (this.onResolveError === undefined) throw error;
-      recovered = true;
-      value = this.onResolveError(error, copy ?? this.payloadCopy());
-      promise = toPromise(value);
+    } catch (thrown) {
+      failed = true;
+      error = thrown;
     }
-    if (this.stopped) {
-      quiet(promise);
-      if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value), this.stopReason);
-      throw this.stopReason;
-    }
-    // Fast path: bytes with nothing queued ahead go straight out.
-    if (value instanceof Uint8Array && this.slots.length === 0) {
-      if (value.length > 0) this.out.emit(value);
-      if (this.stats !== undefined) this.stats.resolved++;
-      this.endToken();
-      return;
-    }
-    if (promise !== undefined) {
-      const slot = this.addSlot(undefined, copy ?? this.payloadCopy());
-      slot.recovered = recovered;
-      this.watch(slot, promise);
-      this.out.flushInitial();
-    } else this.place(value);
+    // Fast path: bytes go out, or behind the queue, with no further checks.
+    if (value instanceof Uint8Array && !this.stopped) {
+      this.emit(value);
+      this.replaced++;
+    } else this.accept(value, promise, failed, error, copy ?? this.payloadCopy());
     this.endToken();
-  }
-
-  /** A synchronous replacement. */
-  private place(value: unknown): void {
-    if (value === null) {
-      // Null is atomic: verbatim, and the span is not re-scanned.
-      this.emit(this.openBytes);
-      if (this.payloadEnd > this.base) this.emit(this.payloadCopy());
-      this.emit(this.closeBytes);
-      if (this.stats !== undefined) this.stats.rejected++;
-      return;
-    }
-    if (value instanceof Uint8Array) {
-      if (value.length > 0) this.emit(value);
-    } else if (typeof value === "string") {
-      if (value.length > 0) this.emit(encodeText(value, "resolve result"));
-    } else {
-      const iter = iteratorOf(value);
-      if (iter === undefined) throw invalid(value);
-      this.addSlot(iter, EMPTY);
-    }
-    if (this.stats !== undefined) this.stats.resolved++;
-  }
-
-  private addSlot(value: AsyncIterator<Uint8Array> | undefined, payload: Uint8Array): Slot {
-    const slot: Slot = {
-      owner: this,
-      value,
-      verbatim: false,
-      payload,
-      reading: false,
-      recovered: false,
-      after: [],
-      reason: undefined,
-      held: 0,
-    };
-    this.slots.push(slot);
-    this.live++;
-    return slot;
-  }
-
-  private watch(slot: Slot, promise: Promise<unknown>): void {
-    Promise.prototype.then.call(
-      promise,
-      (value: unknown) => {
-        const owner = slot.owner;
-        if (owner !== undefined) owner.settle(slot, value);
-        else if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value), slot.reason);
-      },
-      (error: unknown) => slot.owner?.rejectSlot(slot, error),
-    );
-  }
-
-  private settle(slot: Slot, value: unknown): void {
-    let bytes: Uint8Array | undefined;
-    try {
-      if (value === null) {
-        slot.verbatim = true;
-        bytes = slot.payload;
-      } else if (value instanceof Uint8Array) bytes = value;
-      else if (typeof value === "string") bytes = encodeText(value, "resolve result");
-      else {
-        const iter = iteratorOf(value);
-        if (iter === undefined) throw invalid(value);
-        slot.value = iter;
-      }
-    } catch (error) {
-      this.fail(error);
-      return;
-    }
-    if (bytes !== undefined) {
-      slot.value = bytes;
-      const size = slot.verbatim
-        ? this.openBytes.length + bytes.length + this.closeBytes.length
-        : bytes.length;
-      this.live--;
-      slot.held += size;
-      this.held += size;
-    }
-    slot.payload = EMPTY;
-    if (this.stats !== undefined) {
-      if (slot.verbatim) this.stats.rejected++;
-      else this.stats.resolved++;
-    }
-    this.wake();
-  }
-
-  private rejectSlot(slot: Slot, error: unknown): void {
-    if (this.onResolveError === undefined || slot.recovered) {
-      this.fail(error);
-      return;
-    }
-    slot.recovered = true;
-    let value: unknown;
-    let promise: Promise<unknown> | undefined;
-    try {
-      value = this.onResolveError(error, slot.payload);
-      promise = toPromise(value);
-    } catch (failure) {
-      this.fail(failure);
-      return;
-    }
-    if (this.stopped) quiet(promise);
-    else if (promise !== undefined) this.watch(slot, promise);
-    else this.settle(slot, value);
   }
 
   /** A retainable copy of the committed payload. */
@@ -792,7 +364,7 @@ export class Substituter {
     // Validator: emit `open` verbatim, then re-scan the payload and the tail.
     this.flushStart = this.i + 1;
     this.emit(this.openBytes);
-    if (this.stats !== undefined) this.stats.aborted++;
+    this.aborted++;
     this.requeueTail(this.payload, this.base, this.payloadEnd, from, released, heldK, trailing);
     this.endToken();
   }
@@ -816,7 +388,7 @@ export class Substituter {
     const opens = this.opens;
     for (;;) {
       this.emit(open);
-      if (this.stats !== undefined) this.stats.aborted++;
+      this.aborted++;
       while (this.openHead < opens.length && opens[this.openHead] < this.base) this.openHead++;
       if (this.openHead === opens.length) break;
       const at = opens[this.openHead++];
@@ -935,13 +507,12 @@ export class Substituter {
     this.carry -= count;
   }
 
-  /** Reused buffers are copied out, caller chunks go out by reference. */
   private flushSpan(end: number): void {
     if (end > this.flushStart) {
-      const src = this.src;
-      if (this.srcOwned) this.emit(src.slice(this.flushStart, end));
-      else if (this.slots.length === 0) this.out.emitRange(src, this.flushStart, end);
-      else this.emit(src.subarray(this.flushStart, end));
+      // Common case inline: a caller chunk with nothing queued.
+      if (!this.srcOwned && this.slots.length === 0) {
+        this.out.emitRange(this.src, this.flushStart, end);
+      } else this.emitSpan(this.src, this.flushStart, end, this.srcOwned);
       this.flushStart = end;
     }
   }
@@ -965,14 +536,7 @@ export class Substituter {
     this.carry = 0;
   }
 
-  private reset(reason?: unknown): void {
-    for (const slot of this.slots) releaseSlot(slot, reason);
-    this.slots = [];
-    this.live = 0;
-    this.held = 0;
-    this.paused = false;
-    this.active = false;
-    this.scanning = false;
+  protected clear(): void {
     this.endToken();
     this.payload = EMPTY;
     this.payloadViews.length = 0;
@@ -986,35 +550,12 @@ export class Substituter {
     this.queueLen = 0;
     this.inQueue = false;
     this.restarted = false;
-    this.out.reset();
   }
 }
 
 /** Body for `new TransformStream(...)`. Single use. */
 export function createTokenTransformer(options: TokenTransformOptions): TokenTransformer {
-  const session = new Session<Substituter>(options?.signal);
-  session.open(new Substituter(options, session.close));
-  const body: TokenTransformer & FlowBody = {
-    get paused() {
-      return session.scanner?.paused ?? false;
-    },
-    resume: (ctrl: Controller) => {
-      const s = session.scanner;
-      return s === undefined ? Promise.reject(session.inactive()) : s.resume(ctrl);
-    },
-    transform: (chunk: Uint8Array, ctrl: Controller) => {
-      const s = session.scanner;
-      return s === undefined ? Promise.reject(session.inactive()) : s.transform(chunk, ctrl);
-    },
-    flush: (ctrl: Controller) => {
-      const s = session.scanner;
-      if (s === undefined) throw session.inactive();
-      return s.flush(ctrl);
-    },
-    poke: () => session.scanner?.poke(),
-    cancel: (reason?: unknown) => session.cancel(reason),
-  };
-  return body;
+  return lookaheadBody(options?.signal, (onClose) => new Substituter(options, onClose));
 }
 
 /** Backpressured pair for `pipeThrough`. Single use. */

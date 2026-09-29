@@ -18,7 +18,7 @@ function tooLarge(bytes: number, limit: number, states: number, width: number): 
   );
 }
 
-/** Aho-Corasick as a full DFA over byte classes. Scan state is one int. */
+/** @internal Aho-Corasick as a full DFA over byte classes. Scan state is one int. */
 export class AhoCorasick {
   /** byte -> DFA column. Column 0 is all zeros, for bytes no literal contains. */
   readonly classOf: Uint16Array = new Uint16Array(256);

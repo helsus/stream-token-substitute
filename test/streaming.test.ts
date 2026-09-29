@@ -160,10 +160,10 @@ describe("async transformer", () => {
     expect(await read).toBeInstanceOf(TypeError);
   });
 
-  it("honours flushBytes framing", async () => {
+  it("honours mergeBytes framing", async () => {
     const parts = await runAsyncStreamParts(
       [bytes("a{{name}}b{{city}}c")],
-      asyncOptions({ flushBytes: 0 }),
+      asyncOptions({ mergeBytes: 0 }),
     );
     expect(parts.length).toBeGreaterThan(1);
     expect(decoder.decode(await runAsyncStream([bytes("a{{name}}b")], asyncOptions()))).toBe(
@@ -191,18 +191,18 @@ async function statsFor(
 }
 
 describe("onDone stats", () => {
-  it("counts resolved, rejected and aborted tokens", async () => {
+  it("counts replaced, rejected and aborted tokens", async () => {
     const stats = await statsFor("{{ok}} {{no}} {{toolong}}", {
       maxPayloadBytes: 4,
     });
-    expect(stats.resolved).toBe(1);
+    expect(stats.replaced).toBe(1);
     expect(stats.rejected).toBe(1);
     expect(stats.aborted).toBe(1);
   });
 
-  it("counts an empty substitution as resolved, not rejected", async () => {
+  it("counts an empty substitution as replaced, not rejected", async () => {
     const stats = await statsFor("{{gone}}", { resolve: () => new Uint8Array(0) });
-    expect(stats).toMatchObject({ resolved: 1, rejected: 0, aborted: 0 });
+    expect(stats).toMatchObject({ replaced: 1, rejected: 0, aborted: 0 });
   });
 
   it("reports byte totals that match the actual stream", async () => {
@@ -243,7 +243,7 @@ describe("onDone stats", () => {
         stats = s;
       },
     });
-    expect(stats).toMatchObject({ resolved: 1, rejected: 1, aborted: 0 });
+    expect(stats).toMatchObject({ replaced: 1, rejected: 1, aborted: 0 });
   });
 });
 
@@ -389,13 +389,13 @@ describe("Web factory compatibility", () => {
 
 describe("backpressure", () => {
   for (const mode of ["sync", "async", "literals"] as const) {
-    it(`bounds ${mode} buffering with a large flushBytes setting`, async () => {
+    it(`bounds ${mode} buffering with a large mergeBytes setting`, async () => {
       let calls = 0;
       const resolve = () => {
         calls++;
         return new Uint8Array(99);
       };
-      const options = { open: "{{", close: "}}", resolve, flushBytes: Number.MAX_SAFE_INTEGER };
+      const options = { open: "{{", close: "}}", resolve, mergeBytes: Number.MAX_SAFE_INTEGER };
       const tx =
         mode === "sync"
           ? createTokenStream(options)
@@ -404,7 +404,7 @@ describe("backpressure", () => {
             : createLiteralStream({
                 literals: ["{{x}}"],
                 resolve,
-                flushBytes: options.flushBytes,
+                mergeBytes: options.mergeBytes,
               });
       const reader = tx.readable.getReader();
       const writer = tx.writable.getWriter();

@@ -337,7 +337,7 @@ describe("delimiter shapes", () => {
   });
 });
 
-describe("flushBytes", () => {
+describe("mergeBytes", () => {
   const value = bytes("VALUE");
   const byRef = opts({ resolve: () => value });
 
@@ -349,7 +349,7 @@ describe("flushBytes", () => {
 
   it("emits one part per piece when disabled, aliasing input and value", async () => {
     const chunk = bytes("head{{x}}tail");
-    const parts = await runStreamParts([chunk], { ...byRef, flushBytes: 0 });
+    const parts = await runStreamParts([chunk], { ...byRef, mergeBytes: 0 });
     expect(parts.map((p) => decoder.decode(p))).toEqual(["head", "VALUE", "tail"]);
     expect(parts[0]?.buffer).toBe(chunk.buffer);
     expect(parts[1]).toBe(value);
@@ -364,8 +364,8 @@ describe("flushBytes", () => {
 
   it("splits output once the accumulator reaches the high-water mark", async () => {
     const chunks = [bytes("{{x}}".repeat(400))];
-    const wide = await runStreamParts(chunks, { ...byRef, flushBytes: 256 });
-    const narrow = await runStreamParts(chunks, { ...byRef, flushBytes: 64 });
+    const wide = await runStreamParts(chunks, { ...byRef, mergeBytes: 256 });
+    const narrow = await runStreamParts(chunks, { ...byRef, mergeBytes: 64 });
     expect(narrow.length).toBeGreaterThan(wide.length);
     for (const part of wide.slice(0, -1)) expect(part.length).toBeGreaterThanOrEqual(256);
   });
@@ -373,9 +373,9 @@ describe("flushBytes", () => {
   it("produces identical bytes at every setting", async () => {
     const input = bytes("a{{x}}b{{yy}}c{{}}d{{zzz}}e");
     const expected = substituteBytes(input, opts());
-    for (const flushBytes of [0, 1, 7, 64, 16384, Number.MAX_SAFE_INTEGER]) {
-      const out = await runStream([input], opts({ flushBytes }));
-      expect(hex(out), `flushBytes ${flushBytes}`).toBe(hex(expected));
+    for (const mergeBytes of [0, 1, 7, 64, 16384, Number.MAX_SAFE_INTEGER]) {
+      const out = await runStream([input], opts({ mergeBytes }));
+      expect(hex(out), `mergeBytes ${mergeBytes}`).toBe(hex(expected));
     }
   });
 
@@ -387,7 +387,7 @@ describe("flushBytes", () => {
 
   it("rejects invalid values", () => {
     for (const bad of [-1, 1.5, Number.NaN, "16" as unknown as number]) {
-      expect(() => nativeTokenStream(opts({ flushBytes: bad }))).toThrow(RangeError);
+      expect(() => nativeTokenStream(opts({ mergeBytes: bad }))).toThrow(RangeError);
     }
   });
 });

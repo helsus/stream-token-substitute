@@ -67,7 +67,7 @@ it("batches output without changing its size", async () => {
   const input = makeDocument((i) => (i < 0 ? "{{t0}}" : `{{h${i}}}`), 500);
 
   const buffered = await drain(input, nativeTokenStream(tokenOptions));
-  const unbuffered = await drain(input, nativeTokenStream({ ...tokenOptions, flushBytes: 0 }));
+  const unbuffered = await drain(input, nativeTokenStream({ ...tokenOptions, mergeBytes: 0 }));
   const literals = await drain(
     makeDocument(() => "__ID__", 500),
     nativeLiteralStream({ literals: { __ID__: "0123456789abcdef" } }),

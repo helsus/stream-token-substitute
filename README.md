@@ -13,13 +13,11 @@ import { resolveFrom, substituteResponse } from "stream-token-substitute"
 
 const shell = await fetch("https://example.com/shell.html")
 const response = substituteResponse(shell, {
-  open: "{{",
-  close: "}}",
   resolve: resolveFrom({ nonce: crypto.randomUUID() }),
 })
 ```
 
-`resolveFrom` takes a record or `Map` of names to strings or bytes. Unknown tokens stay unchanged. `substituteResponse` also accepts any readable/writable pair, such as `createLiteralStream(...)`.
+`resolveFrom` takes a record or `Map` of names to strings or bytes. Unknown tokens stay unchanged. `resolveName((name, context) => ...)` hands your function the payload decoded as UTF-8. `substituteResponse` also accepts any readable/writable pair, such as `createLiteralStream(...)`.
 
 ## Raw streams
 
@@ -39,18 +37,20 @@ Create one per stream. Replacement bytes are never re-scanned.
 
 | Option | Default | Behavior |
 | --- | --- | --- |
-| `open` | required | Non-empty string or `Uint8Array`. |
-| `close` | `open` | Non-empty string or `Uint8Array`. |
-| `resolve(payload)` | required | See return types below. |
+| `open` | `"{{"` | Non-empty string or `Uint8Array`. |
+| `close` | `open`, or `"}}"` if `open` is omitted | Non-empty string or `Uint8Array`. |
+| `resolve(payload, context)` | required | See return types below. |
 | `validate(payload, next)` | none | Return `false` to abort before committing `next`. |
 | `maxPayloadBytes` | `64` | Abort tokens with a longer payload. |
 | `concurrency` | `4` | Pending async results scanned ahead of output. |
-| `flushBytes` | `16384` | Merge small output pieces up to this size. `0` disables. |
-| `onResolveError(error, payload)` | none | Recover from a throw or rejection with a replacement or `null`. |
+| `mergeBytes` | `16384` | Merge small output pieces up to this size. `0` disables. |
+| `onResolveError(error, payload, context)` | none | Recover from a throw or rejection with a replacement or `null`. |
 | `signal` | none | Abort stops scanning and errors the stream with the reason. |
-| `onDone(stats)` | none | On flush: `resolved`, `rejected`, `aborted`, `bytesIn`, `bytesOut`. |
+| `onDone(stats)` | none | On flush: `replaced`, `rejected`, `aborted`, `bytesIn`, `bytesOut`. |
 
-`resolve` may return `Uint8Array`, `string` (UTF-8 encoded), `null` (keep the token verbatim), a `ReadableStream<Uint8Array>` or `AsyncIterable<Uint8Array>` (streamed in order), or a promise of any of these. Output order always matches input order.
+`resolve` may return `Uint8Array`, `string` (UTF-8 encoded), `null` (keep the token verbatim), a `ReadableStream`, async iterable or iterable of `Uint8Array` or `string` pieces (streamed in order), or a promise of any of these. Output order always matches input order.
+
+`context.signal` is an `AbortSignal` that aborts with the reason when the stream stops early (cancel, abort, or failure), never on normal completion. It is created on first read, so an unused signal costs nothing.
 
 Matching is byte-exact. The first closing delimiter ends a token. Aborted tokens emit their opening delimiter and re-scan the payload. Incomplete tokens pass through at end of stream. Invalid options throw synchronously. Unhandled resolver errors and validator errors fail the stream.
 
@@ -69,7 +69,7 @@ const literals = compileLiterals({ __BUILD_ID__: "v2.0.0", __APP_NAME__: "Exampl
 input.pipeThrough(createLiteralStream({ literals }))
 ```
 
-Compile once and reuse across streams. `literals` also accepts an uncompiled record, a `Map` with string or byte keys, or an array with `resolve(literal, index)`. Matching is leftmost-longest, byte-exact, and duplicates keep the first entry. Options: `literals`, `resolve`, `maxMemoryBytes`, `flushBytes`, `signal`, `onDone`. `createLiteralTransformer` is the `TransformStream` body counterpart. The `literal` view passed to `resolve` is valid only during the call. Returning it is safe.
+Compile once and reuse across streams. `literals` also accepts an uncompiled record, a `Map` with string or byte keys, or an array with `resolve(literal, index, context)`. Matching is leftmost-longest, byte-exact, and duplicates keep the first entry. Options: `literals`, `resolve`, `maxMemoryBytes`, `concurrency`, `mergeBytes`, `onResolveError`, `signal`, `onDone` (`replaced`, `rejected`, `bytesIn`, `bytesOut`). `resolve` follows the token contract: it gets a fresh copy of the literal and may return anything a token resolver can. `createLiteralTransformer` is the `TransformStream` body counterpart.
 
 ## Node
 
@@ -79,7 +79,7 @@ import { createLiteralTransform, createTokenTransform } from "stream-token-subst
 await pipeline(source, createTokenTransform(options, { highWaterMark, signal }), sink)
 ```
 
-Output parts are `Buffer`-compatible views. Backpressure uses the readable high-water mark.
+Both return a Node `Transform`. Output parts are `Buffer`-compatible views. Backpressure uses the readable high-water mark.
 
 ## Escaping
 

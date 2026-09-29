@@ -16,6 +16,18 @@ export function substituteLiterals(
   options: LiteralTransformOptions,
 ): Uint8Array {
   const { set, resolve } = compileLiteralOptions(options);
+  const context = {
+    get signal() {
+      return new AbortController().signal;
+    },
+  };
+  const lookup = (bytes: Uint8Array, index: number): Uint8Array | null => {
+    if (Array.isArray(resolve)) return resolve[index];
+    const value = resolve(bytes.slice(), index, context);
+    if (typeof value === "string") return new TextEncoder().encode(value);
+    if (value === null || value instanceof Uint8Array) return value;
+    throw new TypeError("the reference takes sync byte, string or null results only");
+  };
   const literals = set.literals;
   const out: Uint8Array[] = [];
   let contentStart = 0;
@@ -36,7 +48,7 @@ export function substituteLiterals(
       continue;
     }
     if (i > contentStart) out.push(input.subarray(contentStart, i));
-    const value = resolve(input.subarray(i, i + bestLen), best);
+    const value = lookup(input.subarray(i, i + bestLen), best);
     // Null is atomic: verbatim, and the span is not re-scanned.
     out.push(value === null ? input.subarray(i, i + bestLen) : value);
     i += bestLen;

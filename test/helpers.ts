@@ -108,13 +108,13 @@ export function deferResolver(
   resolve: TokenResolver,
   mode: "sync" | "micro" | "macro" = "micro",
 ): TokenResolver {
-  return (payload) => {
+  return (payload, context) => {
     // The payload handed to an async resolver must survive the await, so a
     // correct implementation can read it after suspending. Read it late on
     // purpose: if it were the shared scratch, this would see the next token.
-    if (mode === "sync") return resolve(payload);
-    if (mode === "micro") return Promise.resolve().then(() => resolve(payload));
-    return new Promise((done) => setTimeout(() => done(resolve(payload)), 0));
+    if (mode === "sync") return resolve(payload, context);
+    if (mode === "micro") return Promise.resolve().then(() => resolve(payload, context));
+    return new Promise((done) => setTimeout(() => done(resolve(payload, context)), 0));
   };
 }
 

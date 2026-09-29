@@ -78,25 +78,27 @@ describe("escapeJson sizing", () => {
   });
 });
 
+const ctx = { signal: new AbortController().signal };
+
 describe("resolveFrom", () => {
   it("matches names as bytes from a record", () => {
     const resolve = resolveFrom({ name: "Ada", city: "London" });
-    expect(decoder.decode(resolve(bytes("name")) as Uint8Array)).toBe("Ada");
-    expect(decoder.decode(resolve(bytes("city")) as Uint8Array)).toBe("London");
+    expect(decoder.decode(resolve(bytes("name"), ctx) as Uint8Array)).toBe("Ada");
+    expect(decoder.decode(resolve(bytes("city"), ctx) as Uint8Array)).toBe("London");
   });
 
   it("returns null for an unknown name, which emits it verbatim", () => {
     const resolve = resolveFrom({ name: "Ada" });
-    expect(resolve(bytes("nope"))).toBeNull();
-    expect(resolve(bytes(""))).toBeNull();
+    expect(resolve(bytes("nope"), ctx)).toBeNull();
+    expect(resolve(bytes(""), ctx)).toBeNull();
   });
 
   it("does not confuse names that share a length or a prefix", () => {
     const resolve = resolveFrom({ ab: "1", ac: "2", a: "3", abc: "4" });
-    expect(decoder.decode(resolve(bytes("ab")) as Uint8Array)).toBe("1");
-    expect(decoder.decode(resolve(bytes("ac")) as Uint8Array)).toBe("2");
-    expect(decoder.decode(resolve(bytes("a")) as Uint8Array)).toBe("3");
-    expect(decoder.decode(resolve(bytes("abc")) as Uint8Array)).toBe("4");
+    expect(decoder.decode(resolve(bytes("ab"), ctx) as Uint8Array)).toBe("1");
+    expect(decoder.decode(resolve(bytes("ac"), ctx) as Uint8Array)).toBe("2");
+    expect(decoder.decode(resolve(bytes("a"), ctx) as Uint8Array)).toBe("3");
+    expect(decoder.decode(resolve(bytes("abc"), ctx) as Uint8Array)).toBe("4");
   });
 
   it("resolves hash collisions", () => {
@@ -111,26 +113,26 @@ describe("resolveFrom", () => {
       ffffffff: "f",
       gggggggg: "g",
     });
-    expect(decoder.decode(resolve(bytes("uwxqzevt")) as Uint8Array)).toBe("first");
-    expect(decoder.decode(resolve(bytes("rlttrteo")) as Uint8Array)).toBe("second");
-    expect(resolve(bytes("zzzzzzzz"))).toBeNull();
+    expect(decoder.decode(resolve(bytes("uwxqzevt"), ctx) as Uint8Array)).toBe("first");
+    expect(decoder.decode(resolve(bytes("rlttrteo"), ctx) as Uint8Array)).toBe("second");
+    expect(resolve(bytes("zzzzzzzz"), ctx)).toBeNull();
   });
 
   it("accepts a Map and Uint8Array values", () => {
     const resolve = resolveFrom(new Map([["k", bytes("V")]]));
-    expect(decoder.decode(resolve(bytes("k")) as Uint8Array)).toBe("V");
+    expect(decoder.decode(resolve(bytes("k"), ctx) as Uint8Array)).toBe("V");
   });
 
   it("copies Uint8Array values so later mutation cannot leak", () => {
     const value = bytes("AAA");
     const resolve = resolveFrom(new Map([["k", value]]));
     value[0] = 0x5a;
-    expect(decoder.decode(resolve(bytes("k")) as Uint8Array)).toBe("AAA");
+    expect(decoder.decode(resolve(bytes("k"), ctx) as Uint8Array)).toBe("AAA");
   });
 
   it("handles multi-byte names", () => {
     const resolve = resolveFrom({ "\u540d\u524d": "Ada" });
-    expect(decoder.decode(resolve(bytes("\u540d\u524d")) as Uint8Array)).toBe("Ada");
+    expect(decoder.decode(resolve(bytes("\u540d\u524d"), ctx) as Uint8Array)).toBe("Ada");
   });
 });
 

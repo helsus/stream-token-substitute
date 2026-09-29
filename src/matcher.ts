@@ -1,12 +1,16 @@
 /** KMP delimiter matcher. State is `k`, so a partial match survives chunks. */
 
+/** @internal */
 export const ADVANCED = 0;
+/** @internal */
 export const COMPLETE = 1;
+/** @internal */
 export const REJECTED = 2;
 
+/** @internal */
 export type MatchResult = typeof ADVANCED | typeof COMPLETE | typeof REJECTED;
 
-/** fail[i] = longest proper prefix of pat[0..i] that is also a suffix of it. */
+/** @internal fail[i] = longest proper prefix of pat[0..i] that is also a suffix of it. */
 export function buildFailureTable(pat: Uint8Array): Uint8Array | Uint32Array {
   const n = pat.length;
   const fail = n < 256 ? new Uint8Array(n) : new Uint32Array(n);
@@ -20,6 +24,7 @@ export function buildFailureTable(pat: Uint8Array): Uint8Array | Uint32Array {
   return fail;
 }
 
+/** @internal */
 export class DelimiterMatcher {
   readonly pat: Uint8Array;
   private readonly fail: Uint8Array | Uint32Array;
