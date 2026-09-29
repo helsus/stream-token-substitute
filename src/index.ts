@@ -23,5 +23,4 @@ export type {
   TokenStats,
   TokenTransformer,
   TokenTransformOptions,
-  TokenTransformOptionsBase,
 } from "./types.ts";

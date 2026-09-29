@@ -4,13 +4,13 @@ export function checkSignal(signal: AbortSignal | undefined): void {
   }
 }
 
-export const BLOCKED = Symbol("output backpressure");
-export const BUFFER_LIMIT = Symbol("output buffer limit");
+export type Controller = TransformStreamDefaultController<Uint8Array>;
 
-export type OutputController = TransformStreamDefaultController<Uint8Array> & {
-  [BLOCKED]?: () => boolean;
-  [BUFFER_LIMIT]?: number;
-};
+/** A controller that may report output backpressure. */
+export interface OutputController extends Controller {
+  blocked?(): boolean;
+  bufferLimit?: number;
+}
 
 export interface FlowBody {
   transform(chunk: Uint8Array, ctrl: OutputController): void | Promise<void>;
@@ -18,6 +18,48 @@ export interface FlowBody {
   cancel?(reason?: unknown): void;
   readonly paused?: boolean;
   resume?(ctrl: OutputController): void | Promise<void>;
+  /** Output has room again, so a background drain may continue. */
+  poke?(): void;
+}
+
+/** A single-use scanner with its abort wiring. Once closed, calls fail with `inactive()`. */
+export class Session<S extends { cancel(reason?: unknown): void }> {
+  scanner: S | undefined;
+  #closed = false;
+  #failure: { reason: unknown } | undefined;
+  #signal: AbortSignal | undefined;
+  readonly #onAbort = () => this.cancel(this.#signal?.reason);
+
+  constructor(signal: AbortSignal | undefined) {
+    checkSignal(signal);
+    this.#signal = signal;
+  }
+
+  open(scanner: S): void {
+    this.scanner = scanner;
+    if (this.#signal?.aborted) this.#onAbort();
+    else this.#signal?.addEventListener("abort", this.#onAbort, { once: true });
+  }
+
+  readonly close = (failure?: { reason: unknown }): void => {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#failure = failure;
+    this.scanner = undefined;
+    this.#signal?.removeEventListener("abort", this.#onAbort);
+    this.#signal = undefined;
+  };
+
+  cancel(reason?: unknown): void {
+    this.scanner?.cancel(reason);
+    this.close({ reason });
+  }
+
+  inactive(): unknown {
+    return this.#failure === undefined
+      ? new TypeError("transformer is no longer active")
+      : this.#failure.reason;
+  }
 }
 
 /** Byte-budgeted output, with one atomic replacement of overshoot. */
@@ -59,14 +101,19 @@ export function flowStream(
   };
   const abort = () => stop(input.signal.reason);
   const onSignal = () => stop(signal?.reason);
-  const ctrl = {
+  const ctrl: OutputController = {
+    get desiredSize() {
+      return output.desiredSize;
+    },
     enqueue: (part: Uint8Array) => {
       demand = false;
       output.enqueue(part);
     },
-    [BLOCKED]: blocked,
-    [BUFFER_LIMIT]: 16384,
-  } as OutputController;
+    error: stop,
+    terminate: () => output.close(),
+    blocked,
+    bufferLimit: 16384,
+  };
   const drain = async () => {
     while (body.paused) {
       await ready();
@@ -85,6 +132,7 @@ export function flowStream(
         const resolve = wake;
         wake = reject = undefined;
         resolve?.();
+        body.poke?.();
       },
       cancel: stop,
     },

@@ -1,14 +1,13 @@
-import { AhoCorasick, DEFAULT_MAX_MEMORY_BYTES } from "./aho-corasick.ts";
+import { AhoCorasick } from "./aho-corasick.ts";
 import { copyBytes, EMPTY, encodeText } from "./bytes.ts";
-import { checkSignal, type FlowBody, flowStream } from "./flow.ts";
+import { type Controller, type FlowBody, flowStream, Session } from "./flow.ts";
 import { Emitter } from "./output.ts";
+import { isByteCount, optionalFunction, type TokenTransformer } from "./types.ts";
 
-export { DEFAULT_MAX_MEMORY_BYTES } from "./aho-corasick.ts";
+/** Compile memory ceiling, sized for a 128 MiB Workers isolate. */
+export const DEFAULT_MAX_MEMORY_BYTES = 16 * 1024 * 1024;
 
-type Controller = TransformStreamDefaultController<Uint8Array>;
-
-/** Replacement for a matched literal. `literal` is a view valid only during the
- *  call, returning it is safe. Bytes are enqueued by reference. null emits it verbatim. */
+/** Replacement for a matched literal, or null to keep it. `literal` is valid only during the call, returning it is safe. */
 export type LiteralResolver = (literal: Uint8Array, index: number) => Uint8Array | string | null;
 
 type ByteResolver = (literal: Uint8Array, index: number) => Uint8Array | null;
@@ -44,11 +43,7 @@ export interface LiteralTransformOptions extends CompileLiteralOptions {
   onDone?: (stats: LiteralStats) => void;
 }
 
-export interface LiteralTransformer {
-  transform(chunk: Uint8Array, controller: Controller): void;
-  flush(controller: Controller): void;
-  cancel?(reason?: unknown): void;
-}
+export type LiteralTransformer = TokenTransformer;
 
 interface CompiledLiteralOptions {
   set: LiteralSet;
@@ -57,25 +52,20 @@ interface CompiledLiteralOptions {
   onDone: ((stats: LiteralStats) => void) | undefined;
 }
 
-/** The automaton plus the bytes it matches. Opaque and immutable. */
-class LiteralSet {
+/** The automaton plus the bytes it matches. */
+interface LiteralSet {
   readonly literals: Uint8Array[];
   readonly values: Uint8Array[] | undefined;
   readonly ac: AhoCorasick;
-
-  constructor(
-    literals: Uint8Array[],
-    values: Uint8Array[] | undefined,
-    maxMemoryBytes: number,
-    reserved: number,
-  ) {
-    this.literals = literals;
-    this.values = values;
-    this.ac = new AhoCorasick(literals, maxMemoryBytes, reserved);
-  }
 }
 
-export type CompiledLiterals = LiteralSet;
+/** A compiled literal set from `compileLiterals`. Opaque and immutable. */
+export class CompiledLiterals {
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: nominal brand
+  #brand = true;
+}
+
+const compiledSets = new WeakMap<CompiledLiterals, LiteralSet>();
 
 /** Rolling match index for overlap-heavy streams. */
 class IndexedLiterals {
@@ -208,13 +198,8 @@ export function compileLiterals(
   if (Array.isArray(source)) {
     for (const literal of source) add(literals, encodeText(literal, "literal"));
   } else {
-    const entries =
-      source instanceof Map
-        ? [...source]
-        : (Object.entries(source as Record<string, string | Uint8Array>) as [
-            string | Uint8Array,
-            string | Uint8Array,
-          ][]);
+    const entries: Iterable<[string | Uint8Array, string | Uint8Array]> =
+      source instanceof Map ? source : Object.entries(source);
     values = [];
     for (const [literal, value] of entries) {
       add(literals, encodeText(literal, "literal"));
@@ -226,21 +211,28 @@ export function compileLiterals(
   for (const literal of literals) {
     if (literal.length === 0) throw new TypeError("literals must be non-empty");
   }
-  return new LiteralSet(literals, values, max, reserved);
+  const compiled = new CompiledLiterals();
+  compiledSets.set(compiled, { literals, values, ac: new AhoCorasick(literals, max, reserved) });
+  return compiled;
 }
 
 function kindOf(value: unknown): string {
+  if (value === null) return "null";
   if (typeof value !== "object") return typeof value;
   if (Array.isArray(value)) return "array";
-  return (value as object).constructor?.name ?? "object";
+  return value.constructor?.name ?? "object";
 }
 
+/** @internal */
 export function compileLiteralOptions(options: LiteralTransformOptions): CompiledLiteralOptions {
   if (options == null || typeof options !== "object") {
     throw new TypeError("options must be an object");
   }
   const source = options.literals;
-  const set = source instanceof LiteralSet ? source : compileLiterals(source, options);
+  const set = compiledSets.get(
+    source instanceof CompiledLiterals ? source : compileLiterals(source, options),
+  );
+  if (set === undefined) throw new TypeError("literals must come from compileLiterals");
 
   const user = options.resolve;
   let resolve: ByteResolver;
@@ -262,14 +254,10 @@ export function compileLiteralOptions(options: LiteralTransformOptions): Compile
   }
 
   const flushBytes = options.flushBytes ?? 16384;
-  if (!Number.isSafeInteger(flushBytes) || flushBytes < 0) {
+  if (!isByteCount(flushBytes)) {
     throw new RangeError("flushBytes must be a non-negative safe integer");
   }
-  if (options.onDone !== undefined && typeof options.onDone !== "function") {
-    throw new TypeError("onDone must be a function");
-  }
-
-  return { set, resolve, flushBytes, onDone: options.onDone };
+  return { set, resolve, flushBytes, onDone: optionalFunction(options.onDone, "onDone") };
 }
 
 /** Leftmost-longest literal scanner. Held bytes are bounded by the longest literal. */
@@ -286,16 +274,6 @@ export class LiteralSubstituter {
   private readonly resolve: ByteResolver;
   private readonly onDone: ((stats: LiteralStats) => void) | undefined;
   private readonly out: Emitter;
-  // Automaton tables, cached to skip the double indirection per byte.
-  private readonly delta: Uint16Array | Int32Array;
-  private readonly classOf: Uint16Array;
-  private readonly width: number;
-  private readonly outLen: Uint16Array | Int32Array;
-  private readonly outIdx: Int32Array;
-  private readonly depth: Uint16Array | Int32Array;
-  private readonly firstByteMask: Uint8Array;
-  private readonly soleFirstByte: number;
-  private readonly maxLength: number;
   private readonly literals: readonly Uint8Array[];
   private readonly ac: AhoCorasick;
 
@@ -327,16 +305,6 @@ export class LiteralSubstituter {
     this.resolve = compiled.resolve;
     this.onDone = compiled.onDone;
     this.out = new Emitter(compiled.flushBytes);
-    const ac = compiled.set.ac;
-    this.delta = ac.delta;
-    this.classOf = ac.classOf;
-    this.width = ac.width;
-    this.outLen = ac.outLen;
-    this.outIdx = ac.outIdx;
-    this.depth = ac.depth;
-    this.firstByteMask = ac.firstBytes;
-    this.soleFirstByte = ac.soleFirstByte;
-    this.maxLength = ac.maxLength;
   }
 
   transform(chunk: Uint8Array, ctrl: Controller): void {
@@ -438,7 +406,7 @@ export class LiteralSubstituter {
   private consume(chunk: Uint8Array, count: number): void {
     if (this.holdLen > 0) {
       const held = this.holdLen;
-      const take = this.maxLength < count ? this.maxLength : count;
+      const take = this.ac.maxLength < count ? this.ac.maxLength : count;
       this.ensureHold(held + take);
       copyBytes(this.hold, held, chunk, 0, take);
       // The window sits at offset 0, so a pending match's index carries over.
@@ -504,14 +472,17 @@ export class LiteralSubstituter {
       this.paused = this.out.blocked;
       return;
     }
-    const delta = this.delta;
-    const classOf = this.classOf;
-    const width = this.width;
-    const outLen = this.outLen;
-    const outIdx = this.outIdx;
-    const depth = this.depth;
-    const mask = this.firstByteMask;
-    const sole = this.soleFirstByte;
+    const {
+      delta,
+      classOf,
+      width,
+      outLen,
+      outIdx,
+      depth,
+      firstBytes: mask,
+      soleFirstByte: sole,
+      maxLength,
+    } = this.ac;
     const src = this.src;
     const end = this.srcEnd;
     let i = this.i;
@@ -551,7 +522,7 @@ export class LiteralSubstituter {
         }
       }
       // A maximum-length match cannot extend or lose to an earlier one.
-      if (candStart >= 0 && (candLen === this.maxLength || i - depth[node] > candStart)) {
+      if (candStart >= 0 && (candLen === maxLength || i - depth[node] > candStart)) {
         this.i = i;
         this.node = node;
         this.candStart = candStart;
@@ -634,7 +605,7 @@ export class LiteralSubstituter {
 
   /** Start of the bytes that must outlive the buffer. */
   private windowLen(): number {
-    const d = this.depth[this.node];
+    const d = this.ac.depth[this.node];
     if (this.candStart < 0) return d;
     const span = this.srcEnd - this.candStart;
     return span > d ? span : d;
@@ -665,7 +636,7 @@ export class LiteralSubstituter {
 
   private ensureHold(need: number): void {
     if (need <= this.hold.length) return;
-    const size = Math.min(this.maxLength * 2, Math.max(need, this.hold.length * 2, 64));
+    const size = Math.min(this.ac.maxLength * 2, Math.max(need, this.hold.length * 2, 64));
     const next = new Uint8Array(size);
     next.set(this.hold.subarray(0, this.holdLen));
     this.hold = next;
@@ -704,55 +675,34 @@ export class LiteralSubstituter {
 
 /** Body for `new TransformStream(...)`. Single use. */
 export function createLiteralTransformer(options: LiteralTransformOptions): LiteralTransformer {
-  let signal = options?.signal;
-  checkSignal(signal);
-  let s: LiteralSubstituter | undefined = new LiteralSubstituter(options);
-  let failure: { reason: unknown } | undefined;
-  const stop = (reason?: unknown) => {
-    s?.cancel();
-    s = undefined;
-    failure ??= { reason };
-    signal?.removeEventListener("abort", onAbort);
-    signal = undefined;
+  const session = new Session<LiteralSubstituter>(options?.signal);
+  session.open(new LiteralSubstituter(options));
+  const guard = (action: (s: LiteralSubstituter) => void): void => {
+    const s = session.scanner;
+    if (s === undefined) throw session.inactive();
+    try {
+      action(s);
+    } catch (error) {
+      session.cancel(error);
+      throw error;
+    }
   };
-  const onAbort = () => stop(signal?.reason);
-  const inactive = () => failure?.reason ?? new TypeError("transformer is no longer active");
-  if (signal?.aborted) onAbort();
-  else signal?.addEventListener("abort", onAbort, { once: true });
   const body: LiteralTransformer & FlowBody = {
     get paused() {
-      return s?.paused ?? false;
+      return session.scanner?.paused ?? false;
     },
-    resume: (ctrl: Controller) => {
-      if (s === undefined) throw inactive();
-      try {
+    resume: (ctrl: Controller) =>
+      guard((s) => {
         s.resumeOutput(ctrl);
-        if (s.done) stop();
-      } catch (error) {
-        stop(error);
-        throw error;
-      }
-    },
-    transform: (chunk: Uint8Array, ctrl: Controller) => {
-      if (s === undefined) throw inactive();
-      try {
-        s.transform(chunk, ctrl);
-      } catch (error) {
-        stop(error);
-        throw error;
-      }
-    },
-    flush: (ctrl: Controller) => {
-      if (s === undefined) throw inactive();
-      try {
+        if (s.done) session.close();
+      }),
+    transform: (chunk: Uint8Array, ctrl: Controller) => guard((s) => s.transform(chunk, ctrl)),
+    flush: (ctrl: Controller) =>
+      guard((s) => {
         s.flush(ctrl);
-      } catch (error) {
-        stop(error);
-        throw error;
-      }
-      if (!s.paused) stop();
-    },
-    cancel: stop,
+        if (!s.paused) session.close();
+      }),
+    cancel: (reason?: unknown) => session.cancel(reason),
   };
   return body;
 }

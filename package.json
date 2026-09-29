@@ -43,7 +43,7 @@
     "zero-copy"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:gc": "NODE_OPTIONS=--expose-gc vitest run test/streaming.test.ts test/memory.test.ts",

@@ -1,6 +1,3 @@
-/** Compile memory ceiling, sized for a 128 MiB Workers isolate. */
-export const DEFAULT_MAX_MEMORY_BYTES = 16 * 1024 * 1024;
-
 /** Estimated build bytes: copies, trie, per-state arrays and the DFA table. */
 function estimate(
   reserved: number,
@@ -47,11 +44,7 @@ export class AhoCorasick {
   readonly dict: Int32Array;
 
   /** `reserved` bytes already held by the caller count against the limit. */
-  constructor(
-    literals: readonly Uint8Array[],
-    maxMemoryBytes: number = DEFAULT_MAX_MEMORY_BYTES,
-    reserved = 0,
-  ) {
+  constructor(literals: readonly Uint8Array[], maxMemoryBytes: number, reserved = 0) {
     // Five cells per node: child, sibling, byte, depth, match index + 1.
     let trie = new Uint32Array(5 * 16);
     let states = 1;

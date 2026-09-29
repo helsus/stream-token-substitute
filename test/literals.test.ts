@@ -4,6 +4,7 @@ import {
   compileLiterals,
   createLiteralStream,
   createLiteralTransformer,
+  DEFAULT_MAX_MEMORY_BYTES,
   type LiteralStats,
   LiteralSubstituter,
   type LiteralTransformOptions,
@@ -11,7 +12,7 @@ import {
 import { bytes, concat, decoder, hex, nativeLiteralStream, prng, splitAt } from "./helpers.ts";
 import { substituteLiterals } from "./literal-reference.ts";
 
-async function runNeedleParts(
+async function runLiteralParts(
   chunks: Uint8Array[],
   options: LiteralTransformOptions,
 ): Promise<Uint8Array[]> {
@@ -26,19 +27,19 @@ async function runNeedleParts(
       out.push(value);
     }
   })();
-  try {
-    for (const c of chunks) await writer.write(c);
-    await writer.close();
-  } catch (error) {
-    pump.catch(() => {});
-    throw error;
-  }
+  // workerd reports rejected closed promises as unhandled.
+  pump.catch(() => {});
+  writer.closed.catch(() => {});
+  reader.closed.catch(() => {});
+  writer.ready.catch(() => {});
+  for (const c of chunks) await writer.write(c);
+  await writer.close();
   await pump;
   return out;
 }
 
 const run = async (chunks: Uint8Array[], options: LiteralTransformOptions): Promise<string> =>
-  decoder.decode(concat(await runNeedleParts(chunks, options)));
+  decoder.decode(concat(await runLiteralParts(chunks, options)));
 
 const one = (input: string, options: LiteralTransformOptions): Promise<string> =>
   run([bytes(input)], options);
@@ -113,7 +114,7 @@ describe("literals", () => {
   it("keeps the first entry for a duplicate literal", async () => {
     const options: LiteralTransformOptions = {
       literals: ["dup", "dup"],
-      resolve: (_needle, index) => bytes(`${index}`),
+      resolve: (_literal, index) => bytes(`${index}`),
     };
     expect(await one("dup", options)).toBe("0");
   });
@@ -191,7 +192,7 @@ describe("literals", () => {
   });
 
   it("enqueues one part per piece at flushBytes 0", async () => {
-    const parts = await runNeedleParts([bytes("x__ID__y")], {
+    const parts = await runLiteralParts([bytes("x__ID__y")], {
       literals: { __ID__: "!" },
       flushBytes: 0,
     });
@@ -260,7 +261,7 @@ describe("literals differential", () => {
         for (const cuts of chunkings) {
           for (const flushBytes of [16384, 0]) {
             const actual = concat(
-              await runNeedleParts(splitAt(input, cuts), { ...set.options, flushBytes }),
+              await runLiteralParts(splitAt(input, cuts), { ...set.options, flushBytes }),
             );
             if (hex(actual) !== hex(expected)) {
               throw new Error(
@@ -427,7 +428,7 @@ describe("literal boundaries and table limits", () => {
       for (const size of [1, 3, 16, input.length]) {
         const chunks = [];
         for (let at = 0; at < input.length; at += size) chunks.push(input.subarray(at, at + size));
-        expect(hex(concat(await runNeedleParts(chunks, options)))).toBe(hex(expected));
+        expect(hex(concat(await runLiteralParts(chunks, options)))).toBe(hex(expected));
       }
     }
   });
@@ -464,7 +465,7 @@ describe("literal boundaries and table limits", () => {
 
   it("builds dictionary links listing every literal ending at a node", () => {
     const literals = ["a", "aa", "aaa", "ba", "xaa"].map((n) => bytes(n));
-    const ac = new AhoCorasick(literals);
+    const ac = new AhoCorasick(literals, DEFAULT_MAX_MEMORY_BYTES);
     const ending = (text: string) => {
       let node = 0;
       for (const b of bytes(text)) node = ac.delta[node * ac.width + ac.classOf[b]];
@@ -608,12 +609,18 @@ describe("literal signal", () => {
 
   it("errors a native stream with the abort reason", async () => {
     const controller = new AbortController();
-    controller.abort("gone");
+    const gone = new Error("gone");
+    controller.abort(gone);
     const stream = nativeLiteralStream({ literals: { a: "b" }, signal: controller.signal });
-    const read = stream.readable.getReader().read();
-    const write = stream.writable.getWriter().write(bytes("a"));
-    await expect(write).rejects.toBe("gone");
-    await expect(read).rejects.toBe("gone");
+    const reader = stream.readable.getReader();
+    const writer = stream.writable.getWriter();
+    // workerd reports rejected closed promises as unhandled.
+    reader.closed.catch(() => {});
+    writer.closed.catch(() => {});
+    const read = reader.read();
+    const write = writer.write(bytes("a"));
+    await expect(write).rejects.toBe(gone);
+    await expect(read).rejects.toBe(gone);
   });
 
   it("rejects a non-signal", () => {

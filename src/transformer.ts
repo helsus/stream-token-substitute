@@ -1,5 +1,5 @@
 import { copyBytes, EMPTY, encodeText, requeue } from "./bytes.ts";
-import { checkSignal, type FlowBody, flowStream } from "./flow.ts";
+import { type Controller, type FlowBody, flowStream, Session } from "./flow.ts";
 import { COMPLETE, DelimiterMatcher, REJECTED } from "./matcher.ts";
 import { Emitter } from "./output.ts";
 import {
@@ -12,16 +12,11 @@ import {
   type TokenTransformOptions,
 } from "./types.ts";
 
-const OUTSIDE = 0;
-const IN_TOKEN = 1;
-
 /** Cached payload views per length, so validator calls allocate nothing. */
 const VIEW_CACHE_MAX = 128;
 
 /** Bytes held behind pending slots before scanning waits. */
 const HELD_LIMIT = 65536;
-
-type Controller = TransformStreamDefaultController<Uint8Array>;
 
 /** A pending token plus the output queued behind it. */
 interface Slot {
@@ -46,11 +41,13 @@ function isObject(value: unknown): value is object {
   return value !== null && (typeof value === "object" || typeof value === "function");
 }
 
+function isAsyncIterable(value: unknown): value is AsyncIterable<Uint8Array> {
+  return isObject(value) && Symbol.asyncIterator in value;
+}
+
 /** The iterator of a stream or async iterable result, or undefined. */
 function iteratorOf(value: unknown): AsyncIterator<Uint8Array> | undefined {
-  if (!isObject(value) || !(Symbol.asyncIterator in value)) return undefined;
-  const make = value[Symbol.asyncIterator];
-  return typeof make === "function" ? make.call(value) : undefined;
+  return isAsyncIterable(value) ? value[Symbol.asyncIterator]() : undefined;
 }
 
 function invalid(value: unknown): TypeError {
@@ -62,7 +59,6 @@ function invalid(value: unknown): TypeError {
 
 /** A native promise for a thenable, or undefined. Reads `then` once. */
 function toPromise(value: unknown): Promise<unknown> | undefined {
-  // Normalize subclasses, while leaving ordinary native promises alone.
   if (value instanceof Promise) return Promise.resolve(value);
   if (!isObject(value) || value instanceof Uint8Array) return undefined;
   const then: unknown = Reflect.get(value, "then");
@@ -118,7 +114,7 @@ export class Substituter {
   /** Present only when `onDone` is, so the default path stays untouched. */
   private readonly stats: TokenStats | undefined;
 
-  private state: typeof OUTSIDE | typeof IN_TOKEN = OUTSIDE;
+  private inToken = false;
   private carry = 0;
   // The payload is payload[base..payloadEnd).
   private payload: Uint8Array;
@@ -234,7 +230,7 @@ export class Substituter {
     if (this.stopped) throw this.stopReason;
     this.out.ctrl = ctrl;
     try {
-      if (this.state === IN_TOKEN) {
+      if (this.inToken) {
         this.emit(this.openBytes);
         if (this.payloadEnd > this.base) this.emit(this.payloadCopy());
         if (this.closeM.k > 0) this.emit(this.closeBytes.slice(0, this.closeM.k));
@@ -245,13 +241,18 @@ export class Substituter {
       this.flushing = true;
       return this.run();
     } catch (error) {
-      this.fail(error);
+      this.fail(error, false);
       throw this.stopReason;
     }
   }
 
   cancel(reason: unknown = new Error("transformer cancelled")): void {
-    this.fail(reason);
+    this.fail(reason, false);
+  }
+
+  /** Output has room again. Continues a background drain. */
+  poke(): void {
+    if (!this.active && this.slots.length > 0) this.wake();
   }
 
   private run(): void | Promise<void> {
@@ -269,7 +270,7 @@ export class Substituter {
   }
 
   private failed(error: unknown): Promise<never> {
-    this.fail(error);
+    this.fail(error, false);
     return Promise.reject(this.stopReason);
   }
 
@@ -345,8 +346,10 @@ export class Substituter {
     if (this.stats !== undefined) this.onDone?.(this.stats);
   }
 
-  private fail(reason: unknown): void {
+  private fail(reason: unknown, notify = true): void {
     if (this.stopped) return;
+    // With no call to reject, the failure goes to the output directly.
+    const ctrl = notify && !this.active && this.waiter === undefined ? this.out.ctrl : undefined;
     this.stopped = true;
     this.stopReason = reason;
     this.reset();
@@ -354,6 +357,9 @@ export class Substituter {
     const waiter = this.waiter;
     this.waiter = undefined;
     waiter?.reject(reason);
+    try {
+      ctrl?.error(reason);
+    } catch {}
   }
 
   private halted(): boolean {
@@ -450,7 +456,7 @@ export class Substituter {
         const src = this.src;
         const end = this.srcEnd;
 
-        if (this.state === OUTSIDE) {
+        if (!this.inToken) {
           // No held state: a contained delimiter settles by indexOf and compare.
           if (this.openM.k === 0) {
             const open = this.openBytes;
@@ -558,8 +564,8 @@ export class Substituter {
 
   /** End of a buffer: emit the settled span. Held candidates become virtual. */
   private park(): void {
-    if (this.state !== OUTSIDE) return;
-    // IN_TOKEN: in-token bytes are never part of a pending span.
+    // In-token bytes are never part of a pending span.
+    if (this.inToken) return;
     const k = this.openM.k;
     if (k > 0) {
       this.flushSpan(this.srcEnd - (k - this.carry));
@@ -571,7 +577,7 @@ export class Substituter {
 
   /** Per-byte automaton. The semantic model. The loops above are its fast paths. */
   private step(byte: number): void {
-    if (this.state === OUTSIDE) {
+    if (!this.inToken) {
       const res = this.openM.feed(byte);
       if (res === COMPLETE) {
         this.startToken();
@@ -613,7 +619,7 @@ export class Substituter {
     this.flushSpan(this.i + 1 - (this.openBytes.length - this.carry));
     this.flushStart = this.i + 1;
     this.carry = 0;
-    this.state = IN_TOKEN;
+    this.inToken = true;
     this.clearPayload();
     this.closeM.reset();
   }
@@ -936,7 +942,7 @@ export class Substituter {
   }
 
   private endToken(): void {
-    this.state = OUTSIDE;
+    this.inToken = false;
     this.clearPayload();
     this.closeM.reset();
     this.openM.reset();
@@ -968,37 +974,29 @@ export class Substituter {
   }
 }
 
-/** Body for `new TransformStream(...)`. Single use. No backpressure inside a
- *  chunk: every replacement for a chunk is enqueued before the next read. */
+/** Body for `new TransformStream(...)`. Single use. */
 export function createTokenTransformer(options: TokenTransformOptions): TokenTransformer {
-  let signal = options?.signal;
-  checkSignal(signal);
-  let s: Substituter | undefined;
-  let failure: { reason: unknown } | undefined;
-  const onClose = (closed?: { reason: unknown }) => {
-    failure = closed;
-    s = undefined;
-    signal?.removeEventListener("abort", onAbort);
-    signal = undefined;
-  };
-  const onAbort = () => s?.cancel(signal?.reason);
-  const inactive = () =>
-    failure === undefined ? new TypeError("transformer is no longer active") : failure.reason;
-  s = new Substituter(options, onClose);
-  if (signal?.aborted) onAbort();
-  else signal?.addEventListener("abort", onAbort, { once: true });
+  const session = new Session<Substituter>(options?.signal);
+  session.open(new Substituter(options, session.close));
   const body: TokenTransformer & FlowBody = {
     get paused() {
-      return s?.paused ?? false;
+      return session.scanner?.paused ?? false;
     },
-    resume: (ctrl: Controller) => (s === undefined ? Promise.reject(inactive()) : s.resume(ctrl)),
-    transform: (chunk: Uint8Array, ctrl: Controller) =>
-      s === undefined ? Promise.reject(inactive()) : s.transform(chunk, ctrl),
+    resume: (ctrl: Controller) => {
+      const s = session.scanner;
+      return s === undefined ? Promise.reject(session.inactive()) : s.resume(ctrl);
+    },
+    transform: (chunk: Uint8Array, ctrl: Controller) => {
+      const s = session.scanner;
+      return s === undefined ? Promise.reject(session.inactive()) : s.transform(chunk, ctrl);
+    },
     flush: (ctrl: Controller) => {
-      if (s === undefined) throw inactive();
+      const s = session.scanner;
+      if (s === undefined) throw session.inactive();
       return s.flush(ctrl);
     },
-    cancel: (reason?: unknown) => s?.cancel(reason),
+    poke: () => session.scanner?.poke(),
+    cancel: (reason?: unknown) => session.cancel(reason),
   };
   return body;
 }

@@ -1,7 +1,5 @@
 import { copyBytes } from "./bytes.ts";
-import { BLOCKED, BUFFER_LIMIT, type OutputController } from "./flow.ts";
-
-type Controller = TransformStreamDefaultController<Uint8Array>;
+import type { OutputController } from "./flow.ts";
 
 /** Below this a memcpy is cheaper than an extra read and microtask. */
 const PASS_THROUGH_BYTES = 1024;
@@ -15,13 +13,12 @@ export class Emitter {
   private len = 0;
   private started = false;
   private readonly flushBytes: number;
-  private passThrough: number;
-  private limit: number;
+  private limit = 0;
+  private passThrough = 0;
 
   constructor(flushBytes: number) {
     this.flushBytes = flushBytes;
-    this.limit = flushBytes;
-    this.passThrough = Math.min(PASS_THROUGH_BYTES, flushBytes);
+    this.ctrl = undefined;
   }
 
   get ctrl(): OutputController | undefined {
@@ -30,21 +27,24 @@ export class Emitter {
 
   set ctrl(ctrl: OutputController | undefined) {
     this.controller = ctrl;
-    this.limit = Math.min(this.flushBytes, this.controller?.[BUFFER_LIMIT] ?? this.flushBytes);
+    this.limit = Math.min(this.flushBytes, ctrl?.bufferLimit ?? this.flushBytes);
     this.passThrough = Math.min(PASS_THROUGH_BYTES, this.limit);
   }
 
   get blocked(): boolean {
-    return this.controller?.[BLOCKED]?.() === true;
+    return this.controller?.blocked?.() === true;
+  }
+
+  private get out(): OutputController {
+    if (this.controller === undefined) throw new TypeError("no output controller attached");
+    return this.controller;
   }
 
   emit(part: Uint8Array): void {
     if (part.length === 0) return;
     this.bytesOut += part.length;
     if (part.length >= this.passThrough) {
-      this.flush();
-      this.started = true;
-      (this.ctrl as Controller).enqueue(part);
+      this.send(part, 0, part.length);
       return;
     }
     this.parts.push(part);
@@ -55,19 +55,9 @@ export class Emitter {
   emitRange(part: Uint8Array, start: number, end: number): void {
     const length = end - start;
     if (length === 0) return;
-    // Scanners attach a controller only while processing an active call.
-    const ctrl = this.ctrl as Controller;
     this.bytesOut += length;
-    if (this.limit === 0) {
-      this.started = true;
-      ctrl.enqueue(start === 0 && end === part.length ? part : part.subarray(start, end));
-      return;
-    }
-    // Merging exists to avoid many small parts, and this is not one.
     if (length >= this.passThrough) {
-      this.flush();
-      this.started = true;
-      ctrl.enqueue(start === 0 && end === part.length ? part : part.subarray(start, end));
+      this.send(part, start, end);
       return;
     }
     this.ranges.push(this.parts.length, start, end);
@@ -76,11 +66,17 @@ export class Emitter {
     if (this.len >= this.limit) this.flush();
   }
 
-  /** A lone piece has nothing to merge with, so it goes out by reference. */
+  /** Enqueue part[start..end) behind anything buffered, by reference. */
+  private send(part: Uint8Array, start: number, end: number): void {
+    this.flush();
+    this.started = true;
+    this.out.enqueue(start === 0 && end === part.length ? part : part.subarray(start, end));
+  }
+
   flush(): void {
     const parts = this.parts;
     if (parts.length === 0) return;
-    const ctrl = this.ctrl as Controller;
+    const ctrl = this.out;
     this.started = true;
     if (parts.length === 1) {
       const part = parts[0];

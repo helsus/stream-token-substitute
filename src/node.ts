@@ -1,5 +1,5 @@
 import { type Duplex, Transform, type TransformCallback } from "node:stream";
-import { BLOCKED, BUFFER_LIMIT, type FlowBody, type OutputController } from "./flow.ts";
+import type { FlowBody, OutputController } from "./flow.ts";
 import { createLiteralTransformer, type LiteralTransformOptions } from "./literals.ts";
 import { createTokenTransformer } from "./transformer.ts";
 import type { TokenTransformOptions } from "./types.ts";
@@ -17,13 +17,14 @@ export interface NodeStreamOptions {
 }
 
 class NodeController implements OutputController {
-  blocked = false;
+  /** The last push hit the high-water mark. */
+  full = false;
   readonly #stream: Transform;
-  readonly [BUFFER_LIMIT]: number;
+  readonly bufferLimit: number;
 
   constructor(stream: Transform) {
     this.#stream = stream;
-    this[BUFFER_LIMIT] = Math.max(1, stream.readableHighWaterMark);
+    this.bufferLimit = Math.max(1, stream.readableHighWaterMark);
   }
 
   get desiredSize(): number {
@@ -31,7 +32,7 @@ class NodeController implements OutputController {
   }
 
   enqueue(part: Uint8Array): void {
-    this.blocked = !this.#stream.push(part);
+    this.full = !this.#stream.push(part);
   }
 
   error(reason?: unknown): void {
@@ -42,7 +43,9 @@ class NodeController implements OutputController {
     this.#stream.push(null);
   }
 
-  [BLOCKED] = (): boolean => this.blocked;
+  blocked(): boolean {
+    return this.full;
+  }
 }
 
 // Not Duplex.fromWeb: a rejected writer.ready there escapes as an uncaught TypeError.
@@ -98,17 +101,20 @@ class SubstituteTransform extends Transform {
   #settle(): void {
     if (this.#body?.paused) {
       const resume = () => this.#run((body) => body.resume?.(this.#controller));
-      if (this.#controller.blocked) this.#continue = resume;
+      if (this.#controller.full) this.#continue = resume;
       else resume();
     } else this.#finish();
   }
 
   override _read(size: number): void {
-    this.#controller.blocked = false;
+    this.#controller.full = false;
     const resume = this.#continue;
     this.#continue = undefined;
     if (resume !== undefined) resume();
-    else super._read(size);
+    else {
+      this.#body?.poke?.();
+      super._read(size);
+    }
   }
 
   override _flush(callback: TransformCallback): void {

@@ -188,12 +188,12 @@ const substituteTemplate = (text: string) =>
   text.replace(/\{\{([^}]*)\}\}/g, (whole, key: string) => valueText.get(key) ?? whole);
 
 const SET_SIZE = 32;
-const needleNames = Array.from({ length: SET_SIZE }, (_, i) => `__MARKER_${i}__`);
-const needleValues = Object.fromEntries(
-  needleNames.map((name, i) => [name, `value ${i}`]),
+const literalNames = Array.from({ length: SET_SIZE }, (_, i) => `__MARKER_${i}__`);
+const literalValues = Object.fromEntries(
+  literalNames.map((name, i) => [name, `value ${i}`]),
 ) as Record<string, string>;
 
-const needleDoc = makeDocument((i) => needleNames[i % SET_SIZE] as string);
+const literalDoc = makeDocument((i) => literalNames[i % SET_SIZE] as string);
 
 type Contender = { name: string; open: Open; note: string };
 
@@ -391,7 +391,7 @@ const scenarios: Scenario[] = [
       __NONCE__: "r4nd0m",
     },
   ),
-  literalScenario("32 literal markers", needleDoc, needleValues),
+  literalScenario("32 literal markers", literalDoc, literalValues),
   asyncScenario(),
 ];
 
@@ -665,7 +665,7 @@ function compilationBenchmark() {
   console.log("Memory is sampled allocation growth, not an exact peak.");
   const rows = [];
   for (const [name, source] of [
-    ["32 markers", needleNames],
+    ["32 markers", literalNames],
     ["100K-byte literal", ["a".repeat(100000)]],
   ] as const) {
     const times: number[] = [];

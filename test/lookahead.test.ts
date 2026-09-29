@@ -1,6 +1,7 @@
 // The unified resolver contract and ordered lookahead.
 
 import { describe, expect, it } from "vitest";
+import { createTokenTransform } from "../src/node.ts";
 import { createTokenStream, createTokenTransformer } from "../src/transformer.ts";
 import type { TokenStats, TokenTransformOptions } from "../src/types.ts";
 import { bytes, concat, decoder, deferred, runStream } from "./helpers.ts";
@@ -220,4 +221,95 @@ describe("lookahead", () => {
     await sleep(0);
     expect(cancelled).toHaveLength(2);
   });
+});
+
+describe("background failure and drain", () => {
+  async function* late(value: unknown) {
+    await sleep(5);
+    yield value as Uint8Array;
+  }
+  async function* throwing() {
+    await sleep(5);
+    yield* [];
+    throw new Error("late");
+  }
+  const failures = [
+    ["rejected lookup", () => sleep(5).then(() => Promise.reject(new Error("late")))],
+    ["throwing stream", () => throwing()],
+    ["non-byte piece", () => late("text")],
+  ] as const;
+
+  for (const [name, resolve] of failures) {
+    for (const mode of ["pair", "native", "node"] as const) {
+      it(`surfaces a ${name} after the write settled (${mode})`, async () => {
+        const options = { ...base, resolve: () => resolve() as unknown as Uint8Array };
+        if (mode === "node") {
+          const stream = createTokenTransform(options);
+          const errored = new Promise<unknown>((done) => stream.once("error", done));
+          stream.write(bytes("{{x}}"));
+          stream.resume();
+          await expect(
+            Promise.race([errored, sleep(500).then(() => "hung")]),
+          ).resolves.toBeInstanceOf(Error);
+          return;
+        }
+        const tx =
+          mode === "pair"
+            ? createTokenStream(options)
+            : new TransformStream<Uint8Array, Uint8Array>(createTokenTransformer(options));
+        const writer = tx.writable.getWriter();
+        const reader = tx.readable.getReader();
+        const read = reader.read().then(
+          () => "read",
+          (error: unknown) => error,
+        );
+        await writer.write(bytes("{{x}}"));
+        await expect(Promise.race([read, sleep(500).then(() => "hung")])).resolves.toBeInstanceOf(
+          Error,
+        );
+        writer.releaseLock();
+      });
+    }
+  }
+
+  for (const mode of ["pair", "node"] as const) {
+    it(`resumes a background drain once the reader catches up (${mode})`, async () => {
+      async function* big() {
+        await sleep(1);
+        for (let k = 0; k < 8; k++) yield new Uint8Array(65536);
+      }
+      const options = { ...base, resolve: () => big() };
+      let total = 0;
+      const target = 8 * 65536;
+      let reading: Promise<unknown>;
+      if (mode === "node") {
+        const stream = createTokenTransform(options, { highWaterMark: 1024 });
+        stream.write(bytes("{{x}}"));
+        await sleep(20);
+        reading = new Promise<void>((done) => {
+          stream.on("data", (part: Uint8Array) => {
+            total += part.length;
+            if (total >= target) done();
+          });
+        });
+      } else {
+        const tx = createTokenStream(options);
+        const writer = tx.writable.getWriter();
+        const reader = tx.readable.getReader();
+        const first = reader.read();
+        await writer.write(bytes("{{x}}"));
+        await sleep(20);
+        reading = (async () => {
+          total += (await first).value?.length ?? 0;
+          while (total < target) {
+            const part = await reader.read();
+            if (part.done) break;
+            total += part.value.length;
+          }
+        })();
+      }
+      await Promise.race([reading, sleep(1000)]);
+      expect(total).toBe(target);
+    });
+  }
 });

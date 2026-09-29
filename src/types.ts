@@ -42,7 +42,7 @@ export interface TokenStats {
   bytesOut: number;
 }
 
-/** Structurally a DOM `Transformer<Uint8Array, Uint8Array>`, without needing the DOM lib. */
+/** Structurally a DOM `Transformer<Uint8Array, Uint8Array>`. */
 export interface TokenTransformer {
   transform(
     chunk: Uint8Array,
@@ -53,8 +53,8 @@ export interface TokenTransformer {
   cancel?(reason?: unknown): void;
 }
 
-/** Options common to token transformers. */
-export interface TokenTransformOptionsBase {
+export interface TokenTransformOptions {
+  resolve: TokenResolver;
   /** Opening delimiter. Strings are UTF-8 encoded once. Must be non-empty. */
   open: string | Uint8Array;
   /** Closing delimiter. Defaults to `open`. Must be non-empty. */
@@ -73,10 +73,6 @@ export interface TokenTransformOptionsBase {
   signal?: AbortSignal;
   /** Called once from `flush` with the stream's counts. */
   onDone?: (stats: TokenStats) => void;
-}
-
-export interface TokenTransformOptions extends TokenTransformOptionsBase {
-  resolve: TokenResolver;
 }
 
 /** Normalized options, shared by reference and transformer. */
@@ -107,10 +103,9 @@ function encodeDelimiter(value: string | Uint8Array, name: string): Uint8Array {
   return bytes;
 }
 
-/** isSafeInteger is already false for non-numbers, so no typeof guard is needed. */
-const isByteCount = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
+export const isByteCount = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
 
-function optionalFunction<T>(value: T | undefined, name: string): T | undefined {
+export function optionalFunction<T>(value: T | undefined, name: string): T | undefined {
   if (value !== undefined && typeof value !== "function") {
     throw new TypeError(`${name} must be a function`);
   }

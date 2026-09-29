@@ -44,10 +44,12 @@ export async function runStreamParts(
     for (const c of chunks) await writer.write(c);
     await writer.close();
   } catch (error) {
-    // The reader rejects with the same cause; the write error is the useful
-    // one, so swallow the duplicate rather than leave it unhandled.
-    pump.catch(() => {});
-    throw error;
+    // A background failure errors the output, and close() then only reports an
+    // invalid state. The reader carries the cause.
+    throw await pump.then(
+      () => error,
+      (reason: unknown) => reason,
+    );
   }
   await pump;
   return out;
@@ -80,10 +82,12 @@ export async function runAsyncStreamParts(
     for (const c of chunks) await writer.write(c);
     await writer.close();
   } catch (error) {
-    // The reader rejects with the same cause; the write error is the useful
-    // one, so swallow the duplicate rather than leave it unhandled.
-    pump.catch(() => {});
-    throw error;
+    // A background failure errors the output, and close() then only reports an
+    // invalid state. The reader carries the cause.
+    throw await pump.then(
+      () => error,
+      (reason: unknown) => reason,
+    );
   }
   await pump;
   return out;

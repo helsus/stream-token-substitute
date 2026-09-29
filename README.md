@@ -69,7 +69,7 @@ const literals = compileLiterals({ __BUILD_ID__: "v2.0.0", __APP_NAME__: "Exampl
 input.pipeThrough(createLiteralStream({ literals }))
 ```
 
-Compile once and reuse across streams. `literals` also accepts an uncompiled record, a `Map` with string or byte keys, or an array with `resolve(literal, index)`. Matching is leftmost-longest, byte-exact, and duplicates keep the first entry. Options: `resolve`, `flushBytes`, `signal`, `onDone`. `createLiteralTransformer` is the `TransformStream` body counterpart. The `literal` view passed to `resolve` is valid only during the call. Returning it is safe.
+Compile once and reuse across streams. `literals` also accepts an uncompiled record, a `Map` with string or byte keys, or an array with `resolve(literal, index)`. Matching is leftmost-longest, byte-exact, and duplicates keep the first entry. Options: `literals`, `resolve`, `maxMemoryBytes`, `flushBytes`, `signal`, `onDone`. `createLiteralTransformer` is the `TransformStream` body counterpart. The `literal` view passed to `resolve` is valid only during the call. Returning it is safe.
 
 ## Node
 
@@ -110,6 +110,6 @@ npm run typecheck
 npm run build
 ```
 
-Runtime checks: `test:workers`, `test:bun`, `test:deno`. Fuzzing: `test:fuzz`, with optional `FUZZ_SEED` and `FUZZ_ROUNDS`. `npm run bench` compares throughput, first-output latency, async lookahead, slow-reader expansion, and memory against `String.replace`, replacestream, and replace-content-transformer.
+Runtime checks: `test:workers`, `test:bun`, `test:deno`. Fuzzing: `test:fuzz`, with optional `FUZZ_SEED` and `FUZZ_ROUNDS`. `npm run bench` compares throughput, first-output latency, async lookahead, slow-reader expansion, and memory against `String.replace`, replacestream, and replace-content-transformer. It runs TypeScript directly, so it needs Node 22.18+.
 
 MIT licensed.
