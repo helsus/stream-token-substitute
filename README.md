@@ -40,7 +40,7 @@ Create one per stream. Replacement bytes are never re-scanned.
 | `open` | `"{{"` | Non-empty string or `Uint8Array`. |
 | `close` | `open`, or `"}}"` if `open` is omitted | Non-empty string or `Uint8Array`. |
 | `resolve(payload, context)` | required | See return types below. |
-| `validate(payload, next)` | none | Return `false` to abort before committing `next`. |
+| `validate(payload, next)` | none | Return `false` to abort before committing `next`. `payload` is a view valid only during the call. |
 | `maxPayloadBytes` | `64` | Abort tokens with a longer payload. |
 | `concurrency` | `4` | Pending async results scanned ahead of output. |
 | `borrow` | `false` | Pass `resolve` a view instead of a copy. See Ownership. |
@@ -90,13 +90,13 @@ Both return a Node `Transform`. Output parts are `Buffer`-compatible views. Back
 ## HTTP contract
 
 - The body must be decoded, as `fetch()` yields it. Compressed bytes will not match.
-- Removed headers: `Content-Length`, `Content-Encoding`, `ETag`, `Digest`, `Content-Digest`, `Repr-Digest`, `Content-MD5`, `Accept-Ranges`. Status and other headers are kept.
+- Removed headers: `Content-Length`, `Content-Encoding`, `ETag`, `Digest`, `Content-Digest`, `Repr-Digest`, `Content-MD5`, `Accept-Ranges`. Status and other headers are kept, including `Cache-Control` and `Last-Modified`. For per-request values such as a nonce, set `Cache-Control: private, no-store` yourself.
 - A `206` or any `Content-Range` response throws `TypeError`: request the full representation.
 - Bodyless responses are returned unchanged.
 
 ## Limits and costs
 
-- Token scanning is linear in input. A payload cap abort without `validate` stays linear. With `validate`, an abort replays the payload, so cost grows with `maxPayloadBytes`.
+- Token scanning is linear in input. A payload cap abort without `validate` stays linear. With `validate`, an abort replays the payload, so cost grows with `maxPayloadBytes`: 50 KB of `{{` with an always-true validator and a 1024 cap takes about 0.8 s. Keep the cap small and reject delimiter bytes in `validate`.
 - Literal cost is about input length plus matches. Overlap-heavy sets switch to a rolling index.
 - `compileLiterals(source, { maxMemoryBytes })` refuses sets whose estimated compile memory exceeds `DEFAULT_MAX_MEMORY_BYTES` (16 MiB) unless raised.
 - A single replacement or unmatched span may exceed the 16 KiB output budget. Bound replacement sizes and `concurrency`.

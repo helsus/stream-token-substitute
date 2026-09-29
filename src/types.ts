@@ -27,7 +27,7 @@ export type TokenResolver = (
 ) => Replacement | PromiseLike<Replacement>;
 
 /** Incremental validator, called once per byte committed to the payload.
- *  Return false to abort the token.
+ *  Return false to abort the token. `payload` is a view valid only during the call.
  *  Bytes matching a prefix of `close` are withheld until the match falls through. */
 export type PayloadValidator = (payload: Uint8Array, next: number) => boolean;
 
