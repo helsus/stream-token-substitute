@@ -60,6 +60,7 @@ Matching is byte-exact. The first closing delimiter ends a token. Aborted tokens
 - `payload` is a fresh copy: retaining it or returning it is safe. With `borrow: true` it is a view valid only during the synchronous call, which skips a copy per token. Do not store it, return a view of it, or read it after an await. Returning it unchanged is safe. `resolveFrom` and `resolveName` always borrow.
 - Returned replacement bytes are enqueued by reference. Do not mutate them afterwards.
 - Unmatched input spans are enqueued as views of the input chunks. Do not reuse input buffers.
+- Close, cancel or abort every stream. An abandoned stream keeps its listener on a shared `signal` and its pending lookups alive.
 
 ## Literals
 

@@ -1,5 +1,5 @@
 import { EMPTY, encodeText } from "./bytes.ts";
-import { type Controller, type FlowBody, Session } from "./flow.ts";
+import { type Controller, detachedError, type FlowBody, Session } from "./flow.ts";
 import { Emitter } from "./output.ts";
 import type { ResolveContext, ResolveErrorHandler, TokenTransformer } from "./types.ts";
 
@@ -202,7 +202,7 @@ export abstract class Lookahead {
     }
   }
 
-  cancel(reason: unknown = new Error("transformer cancelled")): void {
+  cancel(reason: unknown = detachedError("transformer cancelled")): void {
     this.fail(reason, false);
   }
 

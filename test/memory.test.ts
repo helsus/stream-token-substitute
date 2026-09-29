@@ -109,6 +109,26 @@ describe.skipIf(!gc)("memory lifecycle", () => {
     expect(body.flush).toBeTypeOf("function");
   });
 
+  it("releases a scanner cancelled without a reason while its resolver stays pending", async () => {
+    const gate = deferred<Uint8Array | null>();
+    const refs = await (async () => {
+      const input = new Uint8Array(4 * 1024 * 1024).fill(120);
+      input.set(bytes("{{x}}"));
+      const body = createTokenTransformer({ resolve: () => gate.promise });
+      const pending = body.transform(input, ctrl);
+      body.cancel?.();
+      await expect(pending).rejects.toBeInstanceOf(Error);
+      const pair = createTokenStream({ resolve: () => gate.promise });
+      const writer = pair.writable.getWriter();
+      writer.write(input).catch(() => {});
+      writer.closed.catch(() => {});
+      await pair.readable.cancel();
+      return [new WeakRef(input.buffer), new WeakRef(body), new WeakRef(pair)];
+    })();
+    for (const ref of refs) await expectCollected(ref);
+    gate.resolve(null);
+  });
+
   it("releases cancelled input while its resolver stays pending", async () => {
     const gate = deferred<Uint8Array | null>();
     const abort = new AbortController();

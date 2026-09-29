@@ -25,6 +25,13 @@ export interface FlowBody {
   poke?(): void;
 }
 
+/** @internal An error whose stack is formatted now, so it does not pin the callers. */
+export function detachedError(message: string, Kind: ErrorConstructor = Error): Error {
+  const error = new Kind(message);
+  void error.stack;
+  return error;
+}
+
 /** @internal A single-use scanner with its abort wiring. Once closed, calls fail with `inactive()`. */
 export class Session<S extends { cancel(reason?: unknown): void }> {
   scanner: S | undefined;
@@ -60,7 +67,7 @@ export class Session<S extends { cancel(reason?: unknown): void }> {
 
   inactive(): unknown {
     return this.#failure === undefined
-      ? new TypeError("transformer is no longer active")
+      ? detachedError("transformer is no longer active", TypeError)
       : this.#failure.reason;
   }
 }
