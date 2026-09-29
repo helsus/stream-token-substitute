@@ -1,6 +1,6 @@
 # stream-token-substitute
 
-Replace `{{tokens}}` or literal strings in a `ReadableStream<Uint8Array>` without buffering the body. Matches survive chunk boundaries, unmatched spans pass through without copying, and resolvers may be sync or async. Zero runtime dependencies. ESM, Node 20+, Cloudflare Workers, Bun, Deno.
+Replace `{{tokens}}` or literal strings in a `ReadableStream<Uint8Array>` without buffering the body. Matches survive chunk boundaries, unmatched spans pass through without copying, and resolvers may be sync or async. Zero runtime dependencies. ESM, Node 22+, Cloudflare Workers, Bun, Deno.
 
 ```sh
 npm install stream-token-substitute
