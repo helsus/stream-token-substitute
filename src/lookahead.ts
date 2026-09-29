@@ -18,6 +18,8 @@ interface Slot {
   verbatim: boolean;
   /** Copy for onResolveError and a late null. */
   payload: Uint8Array;
+  /** Borrowed view the resolver got. Settling to it emits `payload` instead. */
+  arg: Uint8Array | undefined;
   reading: boolean;
   /** Already went through onResolveError. */
   recovered: boolean;
@@ -87,6 +89,7 @@ function releaseSlot(slot: Slot, reason: unknown): void {
   slot.reason = reason;
   slot.after.length = 0;
   slot.payload = EMPTY;
+  slot.arg = undefined;
   const value = slot.value;
   slot.value = EMPTY;
   if (value !== undefined && !(value instanceof Uint8Array)) closeIterator(value, reason);
@@ -239,7 +242,7 @@ export abstract class Lookahead {
 
   /**
    * Take a resolver result. `failed` means the resolver threw `error`. `payload`
-   * is a retainable copy of the match.
+   * is a retainable copy of the match, `arg` the borrowed view if any.
    */
   protected accept(
     value: unknown,
@@ -247,6 +250,7 @@ export abstract class Lookahead {
     failed: boolean,
     error: unknown,
     payload: Uint8Array,
+    arg?: Uint8Array,
   ): void {
     if (this.stopped) {
       quiet(promise);
@@ -268,6 +272,7 @@ export abstract class Lookahead {
     if (promise !== undefined) {
       const slot = this.addSlot(undefined, payload);
       slot.recovered = recovered;
+      slot.arg = arg;
       this.watch(slot, promise);
       this.out.flushInitial();
       return;
@@ -461,6 +466,7 @@ export abstract class Lookahead {
       value,
       verbatim: false,
       payload,
+      arg: undefined,
       reading: false,
       recovered: false,
       after: [],
@@ -490,7 +496,7 @@ export abstract class Lookahead {
       if (value === null) {
         slot.verbatim = true;
         bytes = slot.payload;
-      } else if (value instanceof Uint8Array) bytes = value;
+      } else if (value instanceof Uint8Array) bytes = value === slot.arg ? slot.payload : value;
       else if (typeof value === "string") bytes = encodeText(value, "resolve result");
       else {
         const iter = iteratorOf(value);
@@ -511,6 +517,7 @@ export abstract class Lookahead {
       this.held += size;
     }
     slot.payload = EMPTY;
+    slot.arg = undefined;
     if (slot.verbatim) this.rejected++;
     else this.replaced++;
     this.wake();

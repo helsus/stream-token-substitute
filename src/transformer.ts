@@ -325,12 +325,13 @@ export class Substituter extends Lookahead {
   private finishToken(): void {
     this.flushStart = this.i + 1;
     const copy = this.borrows ? undefined : this.payloadCopy();
+    const arg = copy ?? this.payloadScratch();
     let value: unknown;
     let promise: Promise<unknown> | undefined;
     let failed = false;
     let error: unknown;
     try {
-      value = this.resolve(copy ?? this.payloadScratch(), this.context);
+      value = this.resolve(arg, this.context);
       if (!(value instanceof Uint8Array)) promise = toPromise(value);
     } catch (thrown) {
       failed = true;
@@ -338,9 +339,11 @@ export class Substituter extends Lookahead {
     }
     // Fast path: bytes go out, or behind the queue, with no further checks.
     if (value instanceof Uint8Array && !this.stopped) {
-      this.emit(value);
+      // A borrowed scratch view must not go out by reference.
+      this.emit(value === arg && copy === undefined ? value.slice() : value);
       this.replaced++;
-    } else this.accept(value, promise, failed, error, copy ?? this.payloadCopy());
+    } else if (copy !== undefined) this.accept(value, promise, failed, error, copy);
+    else this.accept(value, promise, failed, error, this.payloadCopy(), arg);
     this.endToken();
   }
 

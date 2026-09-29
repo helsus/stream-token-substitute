@@ -156,6 +156,7 @@ async function assertMatches(
   };
 
   disagree(await runStream(parts, options), "sync");
+  disagree(await runStream(parts, { ...options, borrow: true }), "borrow");
 
   // The async transformer suspends the scanner at every token and resumes it
   // from carried state. Held to the same oracle: an awaited resolver must not

@@ -77,6 +77,9 @@ export interface TokenTransformOptions {
   mergeBytes?: number;
   /** Pending lookups (thenables and unread streams) scanned ahead of output. Default 4. */
   concurrency?: number;
+  /** The resolver never keeps its argument past its synchronous return, so it
+   *  gets a view instead of a copy. Do not store it, return a view of it, or read it after an await. */
+  borrow?: boolean;
   /** Called when `resolve` throws or rejects. Absent: the error propagates and
    *  errors the stream. A throwing `validate` always propagates. */
   onResolveError?: ResolveErrorHandler;
@@ -129,9 +132,14 @@ export function optionalFunction<T>(value: T | undefined, name: string): T | und
 }
 
 /** @internal The output and lookahead settings both scanners share. */
-export function compileShared(options: { mergeBytes?: number; concurrency?: number }): {
+export function compileShared(options: {
+  mergeBytes?: number;
+  concurrency?: number;
+  borrow?: boolean;
+}): {
   mergeBytes: number;
   concurrency: number;
+  borrow: boolean;
 } {
   const mergeBytes = options.mergeBytes ?? DEFAULT_MERGE_BYTES;
   if (!isByteCount(mergeBytes)) {
@@ -141,7 +149,9 @@ export function compileShared(options: { mergeBytes?: number; concurrency?: numb
   if (!Number.isSafeInteger(concurrency) || concurrency < 1) {
     throw new RangeError("concurrency must be a positive safe integer");
   }
-  return { mergeBytes, concurrency };
+  const borrow = options.borrow ?? false;
+  if (typeof borrow !== "boolean") throw new TypeError("borrow must be a boolean");
+  return { mergeBytes, concurrency, borrow };
 }
 
 /** @internal */
@@ -162,6 +172,7 @@ export function compileOptions(options: TokenTransformOptions): CompiledOptions 
   const onResolveError = optionalFunction(options.onResolveError, "onResolveError");
   const onDone = optionalFunction(options.onDone, "onDone");
 
+  const shared = compileShared(options);
   const maxPayloadBytes = options.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
   if (!isByteCount(maxPayloadBytes)) {
     throw new RangeError("maxPayloadBytes must be a non-negative safe integer");
@@ -171,10 +182,10 @@ export function compileOptions(options: TokenTransformOptions): CompiledOptions 
     openBytes,
     closeBytes,
     resolve: options.resolve,
-    borrows: BORROWING.has(options.resolve),
     validate,
     maxPayloadBytes,
-    ...compileShared(options),
+    ...shared,
+    borrows: shared.borrow || BORROWING.has(options.resolve),
     onResolveError,
     onDone,
   };

@@ -43,6 +43,7 @@ Create one per stream. Replacement bytes are never re-scanned.
 | `validate(payload, next)` | none | Return `false` to abort before committing `next`. |
 | `maxPayloadBytes` | `64` | Abort tokens with a longer payload. |
 | `concurrency` | `4` | Pending async results scanned ahead of output. |
+| `borrow` | `false` | Pass `resolve` a view instead of a copy. See Ownership. |
 | `mergeBytes` | `16384` | Merge small output pieces up to this size. `0` disables. |
 | `onResolveError(error, payload, context)` | none | Recover from a throw or rejection with a replacement or `null`. |
 | `signal` | none | Abort stops scanning and errors the stream with the reason. |
@@ -56,7 +57,7 @@ Matching is byte-exact. The first closing delimiter ends a token. Aborted tokens
 
 ## Ownership
 
-- `payload` is a fresh copy: retaining it or returning it is safe.
+- `payload` is a fresh copy: retaining it or returning it is safe. With `borrow: true` it is a view valid only during the synchronous call, which skips a copy per token. Do not store it, return a view of it, or read it after an await. Returning it unchanged is safe. `resolveFrom` and `resolveName` always borrow.
 - Returned replacement bytes are enqueued by reference. Do not mutate them afterwards.
 - Unmatched input spans are enqueued as views of the input chunks. Do not reuse input buffers.
 
@@ -69,7 +70,7 @@ const literals = compileLiterals({ __BUILD_ID__: "v2.0.0", __APP_NAME__: "Exampl
 input.pipeThrough(createLiteralStream({ literals }))
 ```
 
-Compile once and reuse across streams. `literals` also accepts an uncompiled record, a `Map` with string or byte keys, or an array with `resolve(literal, index, context)`. Matching is leftmost-longest, byte-exact, and duplicates keep the first entry. Options: `literals`, `resolve`, `maxMemoryBytes`, `concurrency`, `mergeBytes`, `onResolveError`, `signal`, `onDone` (`replaced`, `rejected`, `bytesIn`, `bytesOut`). `resolve` follows the token contract: it gets a fresh copy of the literal and may return anything a token resolver can. `createLiteralTransformer` is the `TransformStream` body counterpart.
+Compile once and reuse across streams. `literals` also accepts an uncompiled record, a `Map` with string or byte keys, or an array with `resolve(literal, index, context)`. Matching is leftmost-longest, byte-exact, and duplicates keep the first entry. Options: `literals`, `resolve`, `maxMemoryBytes`, `concurrency`, `borrow`, `mergeBytes`, `onResolveError`, `signal`, `onDone` (`replaced`, `rejected`, `bytesIn`, `bytesOut`). `resolve` follows the token contract: it gets a fresh copy of the literal, or a view with `borrow: true`, and may return anything a token resolver can. `createLiteralTransformer` is the `TransformStream` body counterpart.
 
 ## Node
 

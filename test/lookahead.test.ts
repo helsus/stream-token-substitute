@@ -659,3 +659,117 @@ describe("literal lookahead", () => {
     expect(seen?.reason).toBe("stop");
   });
 });
+
+describe("borrow", () => {
+  const literalRun = async (parts: string[], options: LiteralTransformOptions) =>
+    decoder.decode(
+      await new Response(
+        new ReadableStream<Uint8Array>({
+          start(c) {
+            for (const part of parts) c.enqueue(bytes(part));
+            c.close();
+          },
+        }).pipeThrough(createLiteralStream(options)),
+      ).arrayBuffer(),
+    );
+
+  it("hands a borrowing resolver the same scratch buffer", async () => {
+    const buffers: ArrayBufferLike[] = [];
+    await run("{{a}}{{b}}", {
+      borrow: true,
+      resolve: (p) => {
+        buffers.push(p.buffer);
+        return bytes("x");
+      },
+    });
+    expect(buffers[0]).toBe(buffers[1]);
+  });
+
+  it("copies a returned scratch view before emitting it", async () => {
+    expect(await run("{{a}}{{b}}", { borrow: true, resolve: (p) => p })).toBe("ab");
+    expect(await run(["{{ab}}{", "{cd}}"], { borrow: true, resolve: (p) => p })).toBe("abcd");
+  });
+
+  it("keeps null, thenable and stream results intact after the scratch is reused", async () => {
+    const pick = (p: Uint8Array) => decoder.decode(p);
+    expect(
+      await run("{{a}}{{bb}}", { borrow: true, resolve: (p) => (p.length === 1 ? null : "X") }),
+    ).toBe("{{a}}X");
+    expect(
+      await run("{{a}}{{bb}}{{c}}", {
+        borrow: true,
+        resolve: (p) => (p.length === 1 ? sleep(2).then(() => null) : "X"),
+      }),
+    ).toBe("{{a}}X{{c}}");
+    expect(
+      await run("{{a}}{{b}}", {
+        borrow: true,
+        resolve: (p) => streamOf([pick(p).toUpperCase()]),
+      }),
+    ).toBe("AB");
+  });
+
+  it("copies a borrowed view returned asynchronously", async () => {
+    expect(
+      await run("{{a}}{{bb}}{{c}}", { borrow: true, resolve: (p) => sleep(2).then(() => p) }),
+    ).toBe("abbc");
+    expect(
+      await literalRun(["xa", "bxc", "dxa", "b"], {
+        literals: ["ab", "cd"],
+        borrow: true,
+        mergeBytes: 0,
+        resolve: (l) => sleep(1).then(() => l),
+      }),
+    ).toBe("xabxcdxab");
+  });
+
+  it("returns the argument safely after a cap abort and with a validator", async () => {
+    const echo = { borrow: true, resolve: (p: Uint8Array) => p };
+    expect(await run(["{{{{a", "b}}"], { ...echo, maxPayloadBytes: 3 })).toBe("{{ab");
+    expect(await run(["{{a", "b}}{{cd}}"], { ...echo, validate: () => true })).toBe("abcd");
+  });
+
+  it("borrows through the overlap-heavy literal path", async () => {
+    const literals = Array.from({ length: 40 }, (_, k) => `${"a".repeat(k + 1)}b`);
+    literals.push("a");
+    const input = "a".repeat(3000);
+    expect(await literalRun([input], { literals, borrow: true, resolve: (l) => l })).toBe(input);
+  });
+
+  it("gives onResolveError a retainable copy", async () => {
+    expect(
+      await run("{{a}}{{b}}", {
+        borrow: true,
+        resolve: () => {
+          throw new Error("boom");
+        },
+        onResolveError: async (_error, p) => {
+          await sleep(1);
+          return p;
+        },
+      }),
+    ).toBe("ab");
+  });
+
+  it("works for literals across chunk boundaries", async () => {
+    const options = { literals: ["ab", "cd"], borrow: true, resolve: (l: Uint8Array) => l };
+    expect(await literalRun(["xa", "bycd"], options)).toBe("xabycd");
+    const unmerged = { ...options, mergeBytes: 0 };
+    expect(await literalRun(["xa", "bxc", "dxa", "b"], unmerged)).toBe("xabxcdxab");
+    expect(
+      await literalRun(["xa", "bycd"], {
+        literals: ["ab", "cd"],
+        borrow: true,
+        resolve: (_literal, index) => (index === 0 ? sleep(2).then(() => null) : "Z"),
+      }),
+    ).toBe("xabyZ");
+  });
+
+  it("rejects a non-boolean borrow", () => {
+    const borrow = 1 as unknown as boolean;
+    expect(() => createTokenStream({ resolve: () => null, borrow })).toThrow(TypeError);
+    expect(() => createLiteralStream({ literals: ["a"], resolve: () => null, borrow })).toThrow(
+      TypeError,
+    );
+  });
+});

@@ -14,7 +14,7 @@ import {
 /** Compile memory ceiling, sized for a 128 MiB Workers isolate. */
 export const DEFAULT_MAX_MEMORY_BYTES = 16 * 1024 * 1024;
 
-/** Replacement for a matched literal, same contract as `TokenResolver`. `literal` is a fresh copy. */
+/** Replacement for a matched literal, same contract as `TokenResolver`. `literal` is a fresh copy unless `borrow` is set. */
 export type LiteralResolver = (
   literal: Uint8Array,
   index: number,
@@ -49,6 +49,9 @@ export interface LiteralTransformOptions extends CompileLiteralOptions {
   mergeBytes?: number;
   /** Pending lookups (thenables and unread streams) scanned ahead of output. Default 4. */
   concurrency?: number;
+  /** The resolver never keeps its argument past its synchronous return, so it
+   *  gets a view instead of a copy. Do not store it, return a view of it, or read it after an await. */
+  borrow?: boolean;
   /** Called when `resolve` throws or rejects. Absent: the error errors the stream. */
   onResolveError?: ResolveErrorHandler;
   /** Stops the stream with the abort reason. */
@@ -65,6 +68,7 @@ export interface CompiledLiteralOptions {
   resolve: Uint8Array[] | LiteralResolver;
   mergeBytes: number;
   concurrency: number;
+  borrow: boolean;
   onResolveError: ResolveErrorHandler | undefined;
   onDone: ((stats: LiteralStats) => void) | undefined;
 }
@@ -157,7 +161,7 @@ class IndexedLiterals {
       const length = this.literals[match - 1].length;
       const table = this.owner.table;
       if (table !== undefined) this.owner.replace(table[match - 1]);
-      else this.owner.resolveCopy(match - 1, this.copy(this.at, length));
+      else this.owner.resolveMatch(match - 1, this.copy(this.at, length), false);
       this.at += length;
       this.plain = this.at;
       if (this.owner.blocked()) return;
@@ -255,6 +259,7 @@ export class LiteralSubstituter extends Lookahead {
   /** Replacements by index when they come from the literal set. */
   readonly table: Uint8Array[] | undefined;
   private readonly user: LiteralResolver;
+  private readonly borrow: boolean;
   private readonly onDone: ((stats: LiteralStats) => void) | undefined;
   private readonly literals: readonly Uint8Array[];
   private readonly ac: AhoCorasick;
@@ -292,6 +297,7 @@ export class LiteralSubstituter extends Lookahead {
     const resolve = compiled.resolve;
     this.table = Array.isArray(resolve) ? resolve : undefined;
     this.user = Array.isArray(resolve) ? unreachable : resolve;
+    this.borrow = compiled.borrow;
     this.onDone = compiled.onDone;
   }
 
@@ -309,21 +315,23 @@ export class LiteralSubstituter extends Lookahead {
     this.replaced++;
   }
 
-  /** Resolve a match through the user resolver. `copy` is a fresh copy of its bytes. */
-  resolveCopy(index: number, copy: Uint8Array): void {
+  /** Resolve a match through the user resolver. `bytes` is a copy, or a borrowed view if `view`. */
+  resolveMatch(index: number, bytes: Uint8Array, view: boolean): void {
     let value: unknown;
     let promise: Promise<unknown> | undefined;
     let failed = false;
     let error: unknown;
     try {
-      value = this.user(copy, index, this.context);
+      value = this.user(bytes, index, this.context);
       if (!(value instanceof Uint8Array)) promise = toPromise(value);
     } catch (thrown) {
       failed = true;
       error = thrown;
     }
-    if (value instanceof Uint8Array && !this.stopped) this.replace(value);
-    else this.accept(value, promise, failed, error, copy);
+    if (value instanceof Uint8Array && !this.stopped) {
+      this.replace(view && value === bytes ? value.slice() : value);
+    } else if (view) this.accept(value, promise, failed, error, bytes.slice(), bytes);
+    else this.accept(value, promise, failed, error, bytes);
   }
 
   protected begin(chunk: Uint8Array): void {
@@ -575,7 +583,15 @@ export class LiteralSubstituter extends Lookahead {
     this.pendingCommit = false;
     const table = this.table;
     if (table !== undefined) this.replace(table[this.candIdx]);
-    else this.resolveCopy(this.candIdx, this.src.slice(start, end));
+    else {
+      const src = this.src;
+      const view = this.borrow;
+      this.resolveMatch(
+        this.candIdx,
+        view ? src.subarray(start, end) : src.slice(start, end),
+        view,
+      );
+    }
     this.i = end;
     this.flushStart = end;
     this.node = 0;
