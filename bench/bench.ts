@@ -226,9 +226,9 @@ function tokenScenario(title: string, doc: Uint8Array): Scenario {
         name: "stream-token-substitute",
         open: (chunks) =>
           webSource(chunks).pipeThrough(
-            nativeTokenStream(tokenOptions),
+            createTokenStream(tokenOptions),
           ) as unknown as AsyncIterable<Uint8Array>,
-        note: "web streams",
+        note: "web streams, backpressured pair",
       },
       {
         name: "stream-token-substitute/node",
@@ -281,7 +281,9 @@ function literalScenario(
     for (const [name, value] of Object.entries(literals)) out = out.replaceAll(name, value);
     return out;
   };
-  const expected = bytes(substitute(decoder.decode(doc)));
+  // One pass, no rescanning of replaced text.
+  const regex = new RegExp(pattern, "g");
+  const expected = bytes(decoder.decode(doc).replace(regex, (match) => literals[match]));
   return {
     title,
     doc,
@@ -306,7 +308,7 @@ function literalScenario(
         name: "stream-token-substitute literals",
         open: (chunks) =>
           webSource(chunks).pipeThrough(
-            nativeLiteralStream({ literals }),
+            createLiteralStream({ literals }),
           ) as unknown as AsyncIterable<Uint8Array>,
         note: "web streams, Aho-Corasick",
       },
@@ -319,7 +321,7 @@ function literalScenario(
         name: "stream-token-substitute literals (compiled)",
         open: (chunks) =>
           webSource(chunks).pipeThrough(
-            nativeLiteralStream({ literals: compiled }),
+            createLiteralStream({ literals: compiled }),
           ) as unknown as AsyncIterable<Uint8Array>,
         note: "reused automaton",
       },
