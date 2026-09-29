@@ -110,12 +110,12 @@ function decode(bytes: Uint8Array): string {
     if (typeof TextDecoder === "undefined") {
       throw new TypeError("resolveName needs a global TextDecoder");
     }
-    decoder = new TextDecoder();
+    decoder = new TextDecoder("utf-8", { ignoreBOM: true });
   }
   return decoder.decode(bytes);
 }
 
-/** A resolver over the payload decoded as UTF-8. Invalid bytes become U+FFFD. */
+/** A resolver over the payload decoded as UTF-8. Invalid bytes become U+FFFD, a BOM is kept. */
 export function resolveName(
   fn: (name: string, context: ResolveContext) => Replacement | PromiseLike<Replacement>,
 ): TokenResolver {

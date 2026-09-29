@@ -494,6 +494,11 @@ describe("resolveName", () => {
     expect(await run(`{{ab}} {{${E}t${E}}}`, { resolve })).toBe("AB summer");
   });
 
+  it("keeps a leading BOM", async () => {
+    const resolve = resolveName((name) => (name === "\uFEFFa" ? "bom" : name));
+    expect(await run("{{\uFEFFa}}{{a}}", { resolve })).toBe("boma");
+  });
+
   it("passes the context and awaits results", async () => {
     let seen: AbortSignal | undefined;
     const resolve = resolveName(async (name, context) => {
