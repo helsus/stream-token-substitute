@@ -15,6 +15,8 @@ export class Emitter {
   private readonly flushBytes: number;
   private limit = 0;
   private passThrough = 0;
+  /** Only an enqueue can newly block, so a clear check stays valid until the next. */
+  private recheck = true;
 
   constructor(flushBytes: number) {
     this.flushBytes = flushBytes;
@@ -27,12 +29,16 @@ export class Emitter {
 
   set ctrl(ctrl: OutputController | undefined) {
     this.controller = ctrl;
+    this.recheck = true;
     this.limit = Math.min(this.flushBytes, ctrl?.bufferLimit ?? this.flushBytes);
     this.passThrough = Math.min(PASS_THROUGH_BYTES, this.limit);
   }
 
   get blocked(): boolean {
-    return this.controller?.blocked?.() === true;
+    if (!this.recheck) return false;
+    const blocked = this.controller?.blocked?.() === true;
+    this.recheck = blocked;
+    return blocked;
   }
 
   private get out(): OutputController {
@@ -70,6 +76,7 @@ export class Emitter {
   private send(part: Uint8Array, start: number, end: number): void {
     this.flush();
     this.started = true;
+    this.recheck = true;
     this.out.enqueue(start === 0 && end === part.length ? part : part.subarray(start, end));
   }
 
@@ -78,6 +85,7 @@ export class Emitter {
     if (parts.length === 0) return;
     const ctrl = this.out;
     this.started = true;
+    this.recheck = true;
     if (parts.length === 1) {
       const part = parts[0];
       ctrl.enqueue(this.ranges.length === 0 ? part : part.subarray(this.ranges[1], this.ranges[2]));

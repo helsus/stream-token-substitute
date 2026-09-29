@@ -128,6 +128,8 @@ export class Substituter {
   private scanned = 0;
   private opens: number[] = [];
   private openHead = 0;
+  /** A cap abort used the open search, so it needs a reset. */
+  private openSearched = false;
 
   // Chunks may be backed by any ArrayBufferLike, including SharedArrayBuffer.
   private chunk: Uint8Array<ArrayBufferLike> = EMPTY;
@@ -633,7 +635,7 @@ export class Substituter {
     let recovered = false;
     try {
       value = this.resolve(copy ?? this.payloadScratch());
-      promise = toPromise(value);
+      if (!(value instanceof Uint8Array)) promise = toPromise(value);
     } catch (error) {
       if (this.stopped) throw this.stopReason;
       if (this.onResolveError === undefined) throw error;
@@ -645,6 +647,13 @@ export class Substituter {
       quiet(promise);
       if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value));
       throw this.stopReason;
+    }
+    // Fast path: bytes with nothing queued ahead go straight out.
+    if (value instanceof Uint8Array && this.slots.length === 0) {
+      if (value.length > 0) this.out.emit(value);
+      if (this.stats !== undefined) this.stats.resolved++;
+      this.endToken();
+      return;
     }
     if (promise !== undefined) {
       const slot = this.addSlot(undefined, copy ?? this.payloadCopy());
@@ -799,6 +808,7 @@ export class Substituter {
       if (openScan.feed(payload[p]) === COMPLETE) this.opens.push(p + 1 - open.length);
     }
     this.scanned = this.payloadEnd;
+    this.openSearched = true;
     const opens = this.opens;
     for (;;) {
       this.emit(open);
@@ -935,6 +945,8 @@ export class Substituter {
   private clearPayload(): void {
     this.base = 0;
     this.payloadEnd = 0;
+    if (!this.openSearched) return;
+    this.openSearched = false;
     this.scanned = 0;
     this.opens.length = 0;
     this.openHead = 0;
