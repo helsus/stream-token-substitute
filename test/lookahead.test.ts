@@ -214,12 +214,11 @@ describe("lookahead", () => {
     const flushed = body.flush(ctrl);
     abort.abort("stop");
     await expect(flushed).rejects.toBe("stop");
-    // Iterator return() cancels without a reason.
-    expect(cancelled).toHaveLength(1);
+    expect(cancelled).toEqual(["stop"]);
     late.resolve(streamOf(["l"], (reason) => cancelled.push(reason)));
     gate.resolve("S");
     await sleep(0);
-    expect(cancelled).toHaveLength(2);
+    expect(cancelled).toEqual(["stop", "stop"]);
   });
 });
 

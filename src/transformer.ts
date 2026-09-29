@@ -31,6 +31,8 @@ interface Slot {
   /** Already went through onResolveError. */
   recovered: boolean;
   after: Uint8Array[];
+  /** Why the slot was released, passed to a late stream. */
+  reason: unknown;
   /** Bytes this slot contributes to `held`. */
   held: number;
 }
@@ -71,20 +73,21 @@ function quiet(pending: unknown): void {
   if (pending instanceof Promise) Promise.prototype.then.call(pending, undefined, noop);
 }
 
-/** Cancel a stream nobody will read. */
-function closeIterator(iter: AsyncIterator<Uint8Array> | undefined): void {
+/** Cancel a stream nobody will read. A ReadableStream gets `reason` as its cancel reason. */
+function closeIterator(iter: AsyncIterator<Uint8Array> | undefined, reason: unknown): void {
   try {
-    quiet(iter?.return?.());
+    quiet(iter?.return?.(reason));
   } catch {}
 }
 
-function releaseSlot(slot: Slot): void {
+function releaseSlot(slot: Slot, reason: unknown): void {
   slot.owner = undefined;
+  slot.reason = reason;
   slot.after.length = 0;
   slot.payload = EMPTY;
   const value = slot.value;
   slot.value = EMPTY;
-  if (value !== undefined && !(value instanceof Uint8Array)) closeIterator(value);
+  if (value !== undefined && !(value instanceof Uint8Array)) closeIterator(value, reason);
 }
 
 interface Waiter {
@@ -354,7 +357,7 @@ export class Substituter {
     const ctrl = notify && !this.active && this.waiter === undefined ? this.out.ctrl : undefined;
     this.stopped = true;
     this.stopReason = reason;
-    this.reset();
+    this.reset(reason);
     this.onClose({ reason });
     const waiter = this.waiter;
     this.waiter = undefined;
@@ -645,7 +648,7 @@ export class Substituter {
     }
     if (this.stopped) {
       quiet(promise);
-      if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value));
+      if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value), this.stopReason);
       throw this.stopReason;
     }
     // Fast path: bytes with nothing queued ahead go straight out.
@@ -695,6 +698,7 @@ export class Substituter {
       reading: false,
       recovered: false,
       after: [],
+      reason: undefined,
       held: 0,
     };
     this.slots.push(slot);
@@ -708,7 +712,7 @@ export class Substituter {
       (value: unknown) => {
         const owner = slot.owner;
         if (owner !== undefined) owner.settle(slot, value);
-        else if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value));
+        else if (!(value instanceof Uint8Array)) closeIterator(iteratorOf(value), slot.reason);
       },
       (error: unknown) => slot.owner?.rejectSlot(slot, error),
     );
@@ -961,8 +965,8 @@ export class Substituter {
     this.carry = 0;
   }
 
-  private reset(): void {
-    for (const slot of this.slots) releaseSlot(slot);
+  private reset(reason?: unknown): void {
+    for (const slot of this.slots) releaseSlot(slot, reason);
     this.slots = [];
     this.live = 0;
     this.held = 0;
