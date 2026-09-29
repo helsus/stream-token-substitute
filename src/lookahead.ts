@@ -98,13 +98,18 @@ function releaseSlot(slot: Slot, reason: unknown): void {
 /** The signal is created on first read, so an unused context costs nothing. */
 class StreamContext implements ResolveContext {
   #controller: AbortController | undefined;
+  #stopped: { reason: unknown } | undefined;
 
   get signal(): AbortSignal {
-    this.#controller ??= new AbortController();
+    if (this.#controller === undefined) {
+      this.#controller = new AbortController();
+      if (this.#stopped !== undefined) this.#controller.abort(this.#stopped.reason);
+    }
     return this.#controller.signal;
   }
 
   abort(reason: unknown): void {
+    this.#stopped ??= { reason };
     this.#controller?.abort(reason);
   }
 }

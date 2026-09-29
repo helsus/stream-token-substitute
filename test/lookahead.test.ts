@@ -382,6 +382,22 @@ describe("resolve context", () => {
     expect(signals[0].aborted).toBe(true);
     expect(signals[0].reason).toBe("stop");
 
+    let late: AbortSignal | undefined;
+    const lateBody = createTokenTransformer({
+      resolve: async (_p, context) => {
+        await gate.promise;
+        late = context.signal;
+        return "x";
+      },
+    });
+    await lateBody.transform(bytes("{{a}}"), ctrl);
+    lateBody.cancel?.("late");
+    gate.resolve("y");
+    await gate.promise;
+    await Promise.resolve();
+    expect(late?.aborted).toBe(true);
+    expect(late?.reason).toBe("late");
+
     let done: AbortSignal | undefined;
     await run("{{a}}", {
       resolve: async (_p, context) => {

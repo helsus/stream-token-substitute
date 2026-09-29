@@ -1,6 +1,6 @@
 {
   "name": "stream-token-substitute",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Streaming, chunk-boundary-safe, zero-copy byte-level token and literal substitution for Web Streams runtimes",
   "type": "module",
   "sideEffects": false,
