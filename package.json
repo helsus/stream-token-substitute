@@ -58,7 +58,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
-    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/vitest-pool-workers": "^0.23.0",
     "@types/node": "^26.6.3",
     "@types/replacestream": "^4.0.4",
     "replace-content-transformer": "^3.0.2",
